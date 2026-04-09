@@ -324,24 +324,34 @@ class DerivationTree:
         self.invalidate_hash()
 
     def find_subtrees(
-        self, symbol: NonTerminal | str
+        self, symbol: NonTerminal | str, stop_at: Optional[NonTerminal] = None, bfs_mode: bool = True
     ) -> Generator["DerivationTree", None, None]:
         """
         Recursive, breadth-first search to find all trees with the given non-terminal symbol under this tree, including sources of generators.
 
         :param symbol: The non-terminal symbol to find.
+        :param stop_at: An optional actual non-terminal at which to stop the search
         :return: A generator of all trees with the given non-terminal symbol under this tree.
         """
         if isinstance(symbol, str):
-            symbol = NonTerminal(symbol)
+            symbol = NonTerminal(symbol) 
         else:
             assert isinstance(symbol, NonTerminal)
         queue = deque([self])
         while queue:
             current = queue.popleft()
+            if stop_at is not None and current is stop_at:
+                # End the whole thing
+                break
             if current.symbol.is_non_terminal and current.symbol == symbol:
                 yield current
-            queue.extend([*current._children, *current._sources])
+            # for BFS, we add children and sources to the end of the queue
+            if bfs_mode:
+                queue.extend([*current._children, *current._sources])
+            # for DFS, we add children and sources to the beginning of the queue
+            else:
+                queue.extendleft(reversed(current._sources))
+                queue.extendleft(reversed(current._children))
 
     def find_all_trees(self, symbol: NonTerminal | str) -> list["DerivationTree"]:
         warnings.warn(
