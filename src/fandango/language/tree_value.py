@@ -37,7 +37,7 @@ def _str_to_bytes(value: str, encoding: str) -> bytes:
     :return: A bytes object.
     """
     try:
-        return value.encode(encoding=encoding)
+        return value.encode(encoding=encoding, errors="surrogatepass")
     except UnicodeEncodeError as e:
         raise FandangoConversionError(
             f"string to bytes conversion failed, string: {value}, encoding: {encoding}, error: {e}"
@@ -54,7 +54,7 @@ def _bytes_to_str(value: bytes, encoding: str) -> str:
     :return: A string.
     """
     try:
-        return value.decode(encoding=encoding)
+        return value.decode(encoding=encoding, errors="surrogatepass")
     except UnicodeDecodeError as e:
         raise FandangoConversionError(
             f"bytes to string conversion failed, bytes: {value!r}, encoding: {encoding}, error: {e}"
