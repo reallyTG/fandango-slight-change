@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any
 from fandango.language.grammar.has_settings import HasSettings
 from fandango.language.grammar.nodes.node import Node, NodeType
 from fandango.language.grammar.nodes.terminal import TerminalNode
+from fandango.language.symbols.symbol import Symbol
 from fandango.language.symbols.terminal import Terminal
 from fandango.language.tree import DerivationTree
 
@@ -42,6 +43,9 @@ class CharSet(Node):
     ) -> Iterator["Node"]:
         for char in self.chars:
             yield TerminalNode(Terminal(char), self._grammar_settings)
+
+    def to_symbol(self) -> Symbol:
+        return Terminal.from_symbol(f"r'{self.chars}'")
 
     def format_as_spec(self) -> str:
         return self.chars
