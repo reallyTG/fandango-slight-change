@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 
 import enum
+import io
 import logging
+import os
 import re
-from uuid import UUID
-
 import select
 import socket
 import subprocess
 import sys
 import threading
 import time
-from abc import ABC
-from typing import Optional
+from _contextvars import ContextVar
+from abc import ABC, abstractmethod
+from typing import IO, Hashable, Optional
+from uuid import UUID
 
 from fandango.errors import FandangoError, FandangoValueError
 from fandango.language.tree import DerivationTree
 from fandango.logger import LOGGER
-from typing import Hashable
-from _contextvars import ContextVar
 
 EnvKey = Hashable
 
@@ -106,7 +106,9 @@ def split_party_spec(
     return name, protocol, host, port
 
 
-class FandangoParty(ABC):
+class FandangoParty(  # noqa: B024 # this is an abstract base class without any abstract methods
+    ABC
+):
     """Base class for all parties in Fandango."""
 
     def __init__(
@@ -242,6 +244,7 @@ class ProtocolImplementation(ABC):
     def io_instance(self) -> "FandangoIO":
         return self._party_instance.io_instance
 
+    @abstractmethod
     def send(
         self, message: DerivationTree | str | bytes, recipient: Optional[str]
     ) -> None:
@@ -252,12 +255,14 @@ class ProtocolImplementation(ABC):
         """
         raise NotImplementedError("send() method not implemented")
 
+    @abstractmethod
     def start(self) -> None:
         """
         Invoked when protocol communication (re)starts.
         """
         raise NotImplementedError("start() method not implemented")
 
+    @abstractmethod
     def stop(self) -> None:
         """
         Invoked when protocol communication stops.
@@ -265,6 +270,7 @@ class ProtocolImplementation(ABC):
         raise NotImplementedError("stop() method not implemented")
 
     @property
+    @abstractmethod
     def protocol_type(self) -> Protocol:
         """
         :return: The protocol type (`Protocol`) of this protocol implementation.
@@ -682,12 +688,13 @@ class Out(FandangoParty):
     def __init__(self) -> None:
         super().__init__(connection_mode=ConnectionMode.EXTERNAL)
         self.proc = ProcessManager.instance().get_process()
+        self.stdout = ProcessManager.instance().stdout
         threading.Thread(target=self._listen_loop, daemon=True).start()
 
     def _listen_loop(self) -> None:
         while True:
-            if self.proc.stdout is not None:
-                line = self.proc.stdout.read(1)
+            if self.stdout is not None:
+                line = self.stdout.read(1)
                 self.receive(line, self.party_name)
 
 
@@ -724,11 +731,11 @@ class In(FandangoParty):
     ) -> None:
         if self.proc.stdin is not None:
             if isinstance(message, DerivationTree):
-                self.proc.stdin.write(message.to_string())
+                self.proc.stdin.write(message.to_bytes())
             elif isinstance(message, str):
-                self.proc.stdin.write(message)
+                self.proc.stdin.write(message.encode())
             elif isinstance(message, bytes):
-                self.proc.stdin.write(message.decode("utf-8"))
+                self.proc.stdin.write(message)
             else:
                 raise FandangoValueError(
                     f"Party {self.party_name}: Invalid message type: {type(message)}. Must be DerivationTree, str, or bytes."
@@ -757,10 +764,10 @@ class FandangoIO(object):
         try:
             assert CURRENT_ENV_KEY.contextVar is not None
             env_key = CURRENT_ENV_KEY.contextVar.get()
-        except LookupError:
+        except LookupError as err:
             raise RuntimeError(
                 "FandangoIO.instance() called without an active environment"
-            )
+            ) from err
 
         with cls._lock:
             if env_key not in cls._instances:
@@ -827,14 +834,12 @@ class FandangoIO(object):
         fragments: list[tuple[str, str, str | bytes]] = []
         prev_sender: Optional[str] = None
         prev_recipient: Optional[str] = None
-        for idx, (sender, recipient, msg_fragment) in enumerate(
-            self.get_received_msgs()
-        ):
+        for sender, recipient, msg_fragment in self.get_received_msgs():
             if (
                 prev_sender != sender
                 or prev_recipient != recipient
                 or (
-                    type(fragments[-1][2]) != type(msg_fragment) if fragments else False
+                    type(fragments[-1][2]) is type(msg_fragment) if fragments else False
                 )
             ):
                 prev_sender = sender
@@ -906,7 +911,8 @@ class ProcessManager(object):
         """
         self._command: Optional[str | list[str]] = None
         self.lock = threading.Lock()
-        self.proc: Optional[subprocess.Popen[str]] = None
+        self.proc: Optional[subprocess.Popen[bytes]] = None
+        self.stdout: IO[bytes] | IO[str] | None = None
         self.text = True
 
     @classmethod
@@ -917,17 +923,17 @@ class ProcessManager(object):
         try:
             assert CURRENT_ENV_KEY.contextVar is not None
             env_key = CURRENT_ENV_KEY.contextVar.get()
-        except LookupError:
+        except LookupError as err:
             raise RuntimeError(
                 "ProcessManager.instance() called without an active environment"
-            )
+            ) from err
 
         with cls._lock:
             if env_key not in cls._instances:
                 cls._instances[env_key] = cls()
             return cls._instances[env_key]
 
-    def get_process(self) -> subprocess.Popen[str]:
+    def get_process(self) -> subprocess.Popen[bytes]:
         """
         Returns the current process if it exists, otherwise starts a new one based on the command set.
         """
@@ -947,9 +953,9 @@ class ProcessManager(object):
 
     def set_command(self, value: str | list[str], text: bool = True) -> None:
         """Sets the command to be executed to start the process."""
-        assert isinstance(
-            value, (str, list)
-        ), "Command must be a string or a list of strings"
+        assert isinstance(value, (str, list)), (
+            "Command must be a string or a list of strings"
+        )
         with self.lock:
             if self._command == value:
                 return
@@ -962,13 +968,40 @@ class ProcessManager(object):
             return
 
         LOGGER.info(f"Starting subprocess with command {command}")
-        self.proc = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=self.text,
-        )
+
+        if sys.platform != "win32":
+            import pty
+            import tty
+
+            master_fd, slave_fd = pty.openpty()
+            tty.setraw(master_fd)
+
+            self.proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=slave_fd,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                text=False,
+            )
+            os.close(slave_fd)
+            raw_stdout = os.fdopen(master_fd, "rb")
+        else:
+            self.proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                text=False,  # always binary; we wrap manually below
+            )
+            raw_stdout = self.proc.stdout
+            assert raw_stdout is not None
+
+        if self.text:
+            self.stdout = io.TextIOWrapper(raw_stdout, newline="\n")
+        else:
+            self.stdout = raw_stdout
 
 
 def set_program_command(command: str | list[str], text: bool = True) -> None:
