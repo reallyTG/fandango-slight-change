@@ -35,6 +35,11 @@ class IterativeParser:
         self._context_rules = self._compiler._context_rules
         self._tmp_rules = self._compiler._tmp_rules
         self._max_position = -1
+        self.spectra: dict[str, set] = {
+            "finished": set(),
+            "predicted": set(),
+            "incomplete": set(),
+        }
         self._column_index = 0
         self._table: list[Column] = []
         self._parsing_mode = ParsingMode.COMPLETE
@@ -76,6 +81,7 @@ class IterativeParser:
         symbol = state.next_symbol
         assert symbol is not None
         assert isinstance(symbol, NonTerminal)
+        self.spectra["predicted"].add(symbol)
         column = table[column_index]
         if symbol in column.predicted:
             # Predicting the same symbol in the same column again adds nothing
@@ -429,6 +435,7 @@ class IterativeParser:
         column is still being built: items predicted after it never waited for
         it. `predict` hands those in as `late_waiters`.
         """
+        self.spectra["finished"].add(state.nonterminal)
         column = table[column_index]
         force_completed = not state.is_finished
         if state.position < column_index:
@@ -509,6 +516,7 @@ class IterativeParser:
         self._first_consume = True
         self._forest.reset()
         self._max_position = -1
+        self.spectra = {"finished": set(), "predicted": set(), "incomplete": set()}
         self._consumed_length = 0
         self._completed = {}
         self._incomplete = {}
@@ -561,6 +569,7 @@ class IterativeParser:
 
                     self.complete(state, table, column_index)
                 else:
+                    self.spectra["incomplete"].add(state.nonterminal)
                     if (
                         not state.is_terminal_partial_match
                         and state.next_symbol_is_nonterminal()
