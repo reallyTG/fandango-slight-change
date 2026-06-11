@@ -46,6 +46,11 @@ class IterativeParser(
         self._incomplete: set[DerivationTree] = set()
         self._nodes: dict[str, Node] = {}
         self._max_position = -1
+        self.spectra: dict[str, set] = {
+            "finished": set(),
+            "predicted": set(),
+            "incomplete": set(),
+        }
         self.elapsed_time: float = 0.0
         self._process()
         self._table_idx = 0
@@ -289,6 +294,7 @@ class IterativeParser(
         symbol = state.dot
         assert symbol is not None
         assert isinstance(symbol, NonTerminal)
+        self.spectra["predicted"].add(symbol)
         if state.dot in self._rules:
             table[k].update(
                 {ParseState(symbol, k, rule, 0) for rule in self._rules[symbol]}  # type: ignore[arg-type] # TODO:  this is a bug!
@@ -671,6 +677,7 @@ class IterativeParser(
         k: int,
         use_implicit: bool = False,
     ) -> None:
+        self.spectra["finished"].add(state.nonterminal)
         for s in table[state.position].find_dot(state.nonterminal):
             dot_params = dict(s.dot_params or [])
             s = s.next()
@@ -766,6 +773,7 @@ class IterativeParser(
         self._first_consume = True
         self._incomplete.clear()
         self._max_position = -1
+        self.spectra = {"finished": set(), "predicted": set(), "incomplete": set()}
         self._parsing_mode = mode
         self._hookin_parent = deepcopy(hookin_parent)
         self._clear_tmp()
@@ -815,6 +823,7 @@ class IterativeParser(
 
                     self.complete(state, table, curr_table_idx)
                 else:
+                    self.spectra["incomplete"].add(state.nonterminal)
                     if not state.is_incomplete and state.next_symbol_is_nonterminal():
                         self.predict(state, table, curr_table_idx, self._hookin_parent)
                     else:
