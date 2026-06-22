@@ -67,13 +67,21 @@ class ParseState:
 
     def __hash__(self) -> int:
         if self._hash is None:
+            # MUST stay consistent with __eq__ (which ignores `children`): the
+            # Python hash contract requires equal objects to hash equal. Columns
+            # dedup states via a set, which buckets by hash before calling __eq__.
+            # Including `children` here made __eq__-equal states with different
+            # derivation subtrees hash differently, so on an ambiguous grammar the
+            # chart kept one state per parse TREE instead of one per Earley item —
+            # exponential blowup (a 10-element JSON array timed out). The Earley
+            # item identity is (nonterminal, position, symbols, dot); that is the
+            # correct, complete recognition key.
             self._hash = hash(
                 (
                     self.nonterminal,
                     self.position,
                     self.symbols,
                     self._dot,
-                    tuple(self.children),
                 )
             )
         return self._hash
