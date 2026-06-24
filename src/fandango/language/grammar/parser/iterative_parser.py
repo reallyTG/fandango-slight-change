@@ -314,6 +314,18 @@ class IterativeParser(
             node, nt = self._context_rules[symbol]
             self.predict_ctx_rule(state, table, k, node, nt, hookin_parent)
 
+        # Earley nullable-completion fix. If `symbol` already has a zero-width
+        # (nullable) finished state in this column, its completer ran before
+        # `state` was added, so `state` was never advanced past the empty
+        # `symbol`. Re-run that completion now; it advances `state` and is a
+        # no-op (deduped) for any waiter already advanced. Without this, a
+        # nullable nonterminal reachable via two recursion paths (the standard
+        # fuzzingbook list idiom) is silently mis-recognised. iterate over a
+        # copy: complete() appends to the column.
+        for finished in list(table[k].find_complete(symbol)):
+            if finished.position == k:
+                self.complete(finished, table, k)
+
     def current_tree(self) -> Optional[DerivationTree]:
         if len(self._table[self._table_idx]) == 0:
             return None

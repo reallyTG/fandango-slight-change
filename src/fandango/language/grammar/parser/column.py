@@ -9,9 +9,15 @@ class Column:
     def __init__(self, states: Optional[list[ParseState]] = None):
         self.states: list[ParseState] = states or []
         self.dot_map = dict[Symbol, list[ParseState]]()
+        # Finished states indexed by their nonterminal, used to re-complete
+        # zero-width (nullable) items against waiters predicted after the
+        # original completion ran. See IterativeParser.predict.
+        self.complete_map = dict[Symbol, list[ParseState]]()
         self.unique = set(self.states)
         for state in self.states:
             self.dot_map[state.nonterminal].append(state)
+            if state.finished():
+                self.complete_map.setdefault(state.nonterminal, []).append(state)
 
     def __iter__(self) -> Iterator[ParseState]:
         yield from self.states
@@ -43,12 +49,16 @@ class Column:
         old_symbol = old.dot
         if old_symbol is not None:
             self.dot_map[old_symbol].remove(old)
+        elif old.finished() and old.nonterminal in self.complete_map:
+            self.complete_map[old.nonterminal].remove(old)
 
         new_symbol = new.dot
         if new_symbol is not None:
             dot_list = self.dot_map.get(new_symbol, [])
             dot_list.append(new)
             self.dot_map[new_symbol] = dot_list
+        elif new.finished():
+            self.complete_map.setdefault(new.nonterminal, []).append(new)
 
     def __contains__(self, item: ParseState) -> bool:
         return item in self.unique
@@ -57,6 +67,11 @@ class Column:
         if nt is None:
             return []
         return self.dot_map.get(nt, [])
+
+    def find_complete(self, nt: Optional[Symbol]) -> list[ParseState]:
+        if nt is None:
+            return []
+        return self.complete_map.get(nt, [])
 
     def add(self, state: ParseState) -> bool:
         if state not in self.unique:
@@ -67,6 +82,8 @@ class Column:
                 state_list = self.dot_map.get(symbol, [])
                 state_list.append(state)
                 self.dot_map[symbol] = state_list
+            elif state.finished():
+                self.complete_map.setdefault(state.nonterminal, []).append(state)
             return True
         return False
 
