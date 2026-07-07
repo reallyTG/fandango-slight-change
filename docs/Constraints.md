@@ -312,6 +312,12 @@ assert _exit_code == 0
 
 As you see, "soft" constraints are truly optional :-)
 
+```{tip}
+The soft constraints above shape _each individual input_. To instead steer a property of
+the _whole set_ of generated inputs — such as the mean or spread of a field across all
+inputs — see [population-level objectives](sec:distributions).
+```
+
 
 
 ## When Constraints Cannot be Solved
