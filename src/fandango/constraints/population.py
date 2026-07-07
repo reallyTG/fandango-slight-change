@@ -20,6 +20,7 @@ import ast
 import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from statistics import NormalDist
 from typing import Any, Optional
 
 from fandango.constraints.fitness import ValueFitness
@@ -62,14 +63,133 @@ def _count(values: list[Any]) -> int:
     return len(values)
 
 
-# name -> (reducer, accepts_empty). A reducer must accept a list of per-tree values.
-REDUCERS: dict[str, Callable[[list[Any]], float]] = {
+# --- distributional-fit reducers ------------------------------------------- #
+# A distributional fit is the 1-Wasserstein (earth-mover) distance from the empirical
+# distribution of the values to a target distribution. The *only* per-distribution piece
+# is the target's quantile function (inverse CDF); everything else is shared. The handful
+# of fits below are built-in *examples* backed by the stdlib; the full catalogue of
+# distributions is meant to live in the downstream importer via `register_reducer` +
+# `wasserstein_fit` (e.g. wrapping `scipy.stats.<dist>.ppf`). See `register_reducer`.
+def wasserstein_fit(values: list[Any], quantile: Callable[[float], float]) -> float:
+    """1-Wasserstein distance from the empirical distribution of ``values`` to a target
+    described by its quantile function ``quantile(p)`` for ``p`` in ``(0, 1)``.
+
+    Zero iff the sorted samples lie exactly on the target's quantiles, and it grows
+    smoothly (in the values' own units) as the shape drifts — a good soft *minimization*
+    target. Each order statistic ``x_(i)`` is compared to ``quantile((i + 0.5) / n)``;
+    the mean absolute gap is the distance. This is the building block for custom fits: a
+    downstream distribution only needs to supply its quantile function.
+    """
+    xs = sorted(float(v) for v in values)
+    n = len(xs)
+    if n == 0:
+        return 0.0
+    return sum(abs(x - quantile((i + 0.5) / n)) for i, x in enumerate(xs)) / n
+
+
+def _normal_fit(values: list[Any], mu: "int | float", sigma: "int | float") -> float:
+    """Distance to ``Normal(mu, sigma)`` — steer a column toward a bell curve."""
+    if sigma <= 0:
+        raise FandangoValueError(f"normal_fit sigma must be > 0, got {sigma!r}.")
+    return wasserstein_fit(values, NormalDist(float(mu), float(sigma)).inv_cdf)
+
+
+def _lognormal_fit(values: list[Any], mu: "int | float", sigma: "int | float") -> float:
+    """Distance to ``LogNormal(mu, sigma)`` — a right-skewed positive column (``mu`` and
+    ``sigma`` are the mean/stddev of the underlying normal, i.e. of ``log(value)``)."""
+    if sigma <= 0:
+        raise FandangoValueError(f"lognormal_fit sigma must be > 0, got {sigma!r}.")
+    nd = NormalDist(float(mu), float(sigma))
+    return wasserstein_fit(values, lambda p: math.exp(nd.inv_cdf(p)))
+
+
+def _uniform_fit(values: list[Any], lo: "int | float", hi: "int | float") -> float:
+    """Distance to a continuous ``Uniform(lo, hi)`` — flatten a column across a range."""
+    if hi <= lo:
+        raise FandangoValueError(f"uniform_fit needs lo < hi, got ({lo!r}, {hi!r}).")
+    return wasserstein_fit(values, lambda p: lo + p * (hi - lo))
+
+
+def _exponential_fit(values: list[Any], rate: "int | float") -> float:
+    """Distance to ``Exponential(rate)`` (mean ``1/rate``) — a decaying positive column."""
+    if rate <= 0:
+        raise FandangoValueError(f"exponential_fit rate must be > 0, got {rate!r}.")
+    return wasserstein_fit(values, lambda p: -math.log1p(-p) / rate)
+
+
+# name -> reducer. A reducer takes the list of per-tree values, plus any target
+# parameters declared in REDUCER_TARGET_ARITY (evaluated from trailing literal args).
+# The built-in fits are deliberately a small, stdlib-only sample; downstream code adds
+# more distributions with `register_reducer` (see below) rather than editing this dict.
+REDUCERS: dict[str, Callable[..., float]] = {
     "mean": _mean,
     "stddev": _stddev,
     "fraction": _fraction,
     "distinct_count": _distinct_count,
     "count": _count,
+    "normal_fit": _normal_fit,
+    "lognormal_fit": _lognormal_fit,
+    "uniform_fit": _uniform_fit,
+    "exponential_fit": _exponential_fit,
 }
+
+# How many trailing literal target parameters each reducer expects after the generator,
+# e.g. normal_fit(<inner> for x in population, mu, sigma) -> 2. Absent means 0.
+REDUCER_TARGET_ARITY: dict[str, int] = {
+    "normal_fit": 2,
+    "lognormal_fit": 2,
+    "uniform_fit": 2,
+    "exponential_fit": 1,
+}
+
+
+def register_reducer(
+    name: str,
+    reducer: Callable[..., float],
+    *,
+    target_arity: int = 0,
+) -> None:
+    """Register a population reducer so it can be used in an objective by ``name``.
+
+    This is the supported extension point: a downstream package supplies the
+    distributions it needs instead of this repo trying to enumerate them. ``reducer`` is
+    called as ``reducer(values, *target_params)`` where ``values`` is the flat list of
+    per-tree inner values and ``target_params`` are the ``target_arity`` trailing literal
+    arguments from the objective; it must return a float (lower = better under
+    ``minimizing``). For a distributional fit, build it from :func:`wasserstein_fit` and a
+    quantile function::
+
+        from scipy.stats import gamma
+        from fandango.constraints.population import register_reducer, wasserstein_fit
+
+        register_reducer(
+            "gamma_fit",
+            lambda values, a, scale: wasserstein_fit(
+                values, lambda p: gamma.ppf(p, a, scale=scale)
+            ),
+            target_arity=2,
+        )
+        # then, in a .fan spec parsed *after* this call:
+        #   minimizing gamma_fit([int(<age>) for x in population], 2.0, 10.0)
+
+    Registration mutates the process-wide registry, so it must run **before** the spec
+    that references ``name`` is parsed. Re-registering an existing name overrides it,
+    which lets a downstream provide a better-backed implementation of a built-in.
+    """
+    if not name.isidentifier():
+        raise FandangoValueError(
+            f"Reducer name {name!r} must be a valid identifier (it is used as a call "
+            f"in objective expressions)."
+        )
+    if target_arity < 0:
+        raise FandangoValueError(f"target_arity must be >= 0, got {target_arity}.")
+    if name in REDUCERS:
+        LOGGER.info(f"Overriding existing population reducer {name!r}.")
+    REDUCERS[name] = reducer
+    if target_arity:
+        REDUCER_TARGET_ARITY[name] = target_arity
+    else:
+        REDUCER_TARGET_ARITY.pop(name, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -92,6 +212,9 @@ class PopulationAggregate:
     outer_expression: str
     loop_var: str
     inner_searches: dict[str, NonTerminalSearch] = field(default_factory=dict)
+    # Literal target parameters following the generator, e.g. the (mu, sigma) of
+    # normal_fit(<inner> for x in population, 30, 5).
+    reducer_args: list[Any] = field(default_factory=list)
 
 
 class _InnerValue(Value):
@@ -119,12 +242,15 @@ def _references_population(node: ast.AST) -> bool:
 
 
 def _is_population_reducer_call(node: ast.AST) -> bool:
-    """A call ``reducer(<genexp/listcomp> for x in population)``."""
+    """A call ``reducer(<genexp/listcomp> for x in population, *target_params)``.
+
+    The generator must be the first argument; any further positional arguments are the
+    reducer's literal target parameters (e.g. the mu/sigma of ``normal_fit``)."""
     if not (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id in REDUCERS
-        and len(node.args) == 1
+        and len(node.args) >= 1
         and not node.keywords
         and isinstance(node.args[0], (ast.GeneratorExp, ast.ListComp))
     ):
@@ -180,6 +306,24 @@ def try_parse_population_aggregate(
 
     call = reducer_calls[0]
     assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    reducer_name = call.func.id
+
+    # Target parameters (e.g. the mu/sigma of normal_fit) follow the generator as
+    # literal positional args; evaluate them now so the reducer stays a pure list->float.
+    try:
+        reducer_args = [ast.literal_eval(a) for a in call.args[1:]]
+    except (ValueError, SyntaxError):
+        raise FandangoValueError(
+            f"Target parameters of '{reducer_name}' must be literals, e.g. "
+            f"normal_fit(<inner> for x in {POPULATION_BINDER}, 30, 5); got {expression!r}."
+        )
+    expected_arity = REDUCER_TARGET_ARITY.get(reducer_name, 0)
+    if len(reducer_args) != expected_arity:
+        raise FandangoValueError(
+            f"'{reducer_name}' takes {expected_arity} target parameter(s), "
+            f"got {len(reducer_args)}: {expression!r}."
+        )
+
     comp = call.args[0]
     assert isinstance(comp, (ast.GeneratorExp, ast.ListComp))
     generator = comp.generators[0]
@@ -215,11 +359,12 @@ def try_parse_population_aggregate(
     outer_expression = ast.unparse(outer_tree.body)
 
     return PopulationAggregate(
-        reducer_name=call.func.id,
+        reducer_name=reducer_name,
         inner_expression=inner_expression,
         outer_expression=outer_expression,
         loop_var=loop_var,
         inner_searches=inner_searches,
+        reducer_args=reducer_args,
     )
 
 
@@ -298,7 +443,9 @@ class PopulationValue(SoftValue):
     # -- aggregate -> outer score ------------------------------------------ #
     def _outer_score(self, values: Iterable[Any]) -> float:
         values = list(values)
-        aggregate = REDUCERS[self.aggregate.reducer_name](values)
+        aggregate = REDUCERS[self.aggregate.reducer_name](
+            values, *self.aggregate.reducer_args
+        )
         return float(
             eval(
                 self.aggregate.outer_expression,

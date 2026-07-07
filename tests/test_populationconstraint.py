@@ -9,14 +9,21 @@ import unittest
 from pathlib import Path
 
 from fandango.constraints.population import (
+    REDUCER_TARGET_ARITY,
     REDUCERS,
     PopulationValue,
     _count,
     _distinct_count,
+    _exponential_fit,
     _fraction,
+    _lognormal_fit,
     _mean,
+    _normal_fit,
     _stddev,
+    _uniform_fit,
+    register_reducer,
     try_parse_population_aggregate,
+    wasserstein_fit,
 )
 from fandango.errors import FandangoValueError
 from fandango.evolution.algorithm import DefaultAlgorithm, LoggerLevel
@@ -79,9 +86,70 @@ class TestReducers(unittest.TestCase):
     def test_count(self):
         self.assertEqual(_count([1, 1, 2]), 3)
 
+    def test_normal_fit(self):
+        # Samples placed exactly on the target quantiles have ~zero Wasserstein distance;
+        # a uniform shift moves the distance by (almost) the shift amount.
+        nd = statistics.NormalDist(30, 5)
+        on_target = [nd.inv_cdf((i + 0.5) / 200) for i in range(200)]
+        self.assertAlmostEqual(_normal_fit(on_target, 30, 5), 0.0, places=1)
+        shifted = [v + 20 for v in on_target]
+        self.assertAlmostEqual(_normal_fit(shifted, 30, 5), 20.0, places=1)
+        # Empty population yields no signal (0.0), never a ZeroDivisionError.
+        self.assertEqual(_normal_fit([], 30, 5), 0.0)
+
+    def test_normal_fit_rejects_nonpositive_sigma(self):
+        with self.assertRaises(FandangoValueError):
+            _normal_fit([1, 2, 3], 30, 0)
+
+    def test_distribution_fits_are_zero_on_target(self):
+        # Every distributional fit is ~0 when the samples lie on the target's quantiles.
+        import math
+
+        n = 300
+
+        def on_quantiles(q):
+            return [q((i + 0.5) / n) for i in range(n)]
+
+        nd = statistics.NormalDist(30, 5)
+        self.assertAlmostEqual(_normal_fit(on_quantiles(nd.inv_cdf), 30, 5), 0.0, places=1)
+        std = statistics.NormalDist(0, 1)
+        self.assertAlmostEqual(
+            _lognormal_fit(on_quantiles(lambda p: math.exp(std.inv_cdf(p))), 0, 1),
+            0.0,
+            places=1,
+        )
+        self.assertAlmostEqual(
+            _uniform_fit(on_quantiles(lambda p: 10 + p * 20), 10, 30), 0.0, places=1
+        )
+        self.assertAlmostEqual(
+            _exponential_fit(on_quantiles(lambda p: -math.log1p(-p) / 0.5), 0.5),
+            0.0,
+            places=1,
+        )
+
+    def test_distribution_fits_reject_bad_params(self):
+        for call in (
+            lambda: _lognormal_fit([1, 2, 3], 0, 0),
+            lambda: _uniform_fit([1, 2, 3], 30, 10),  # hi <= lo
+            lambda: _exponential_fit([1, 2, 3], 0),
+        ):
+            with self.assertRaises(FandangoValueError):
+                call()
+
     def test_registry(self):
         self.assertEqual(
-            set(REDUCERS), {"mean", "stddev", "fraction", "distinct_count", "count"}
+            set(REDUCERS),
+            {
+                "mean",
+                "stddev",
+                "fraction",
+                "distinct_count",
+                "count",
+                "normal_fit",
+                "lognormal_fit",
+                "uniform_fit",
+                "exponential_fit",
+            },
         )
 
 
@@ -117,6 +185,44 @@ class TestParsePopulationAggregate(unittest.TestCase):
     def test_non_population_returns_none(self):
         c = _parse_objective("minimizing int(<age>)")
         self.assertIsNone(try_parse_population_aggregate(c.expression, c.searches))
+
+    def test_accepts_normal_fit_with_target_params(self):
+        # A distributional reducer carries its target as trailing literal args; the
+        # generator must be bracketed (list form) once extra args are present.
+        c = _parse_objective(
+            "minimizing normal_fit([int(<age>) for x in population], 30, 5)"
+        )
+        agg = try_parse_population_aggregate(c.expression, c.searches)
+        self.assertIsNotNone(agg)
+        self.assertEqual(agg.reducer_name, "normal_fit")
+        self.assertEqual(agg.reducer_args, [30, 5])
+        self.assertEqual(len(agg.inner_searches), 1)
+        # the outer expression is just the substituted aggregate placeholder.
+        self.assertIn("___fandango_population_agg___", agg.outer_expression)
+        self.assertNotIn("normal_fit", agg.outer_expression)
+
+    def test_accepts_exponential_fit_single_param(self):
+        c = _parse_objective(
+            "minimizing exponential_fit([int(<age>) for x in population], 0.5)"
+        )
+        agg = try_parse_population_aggregate(c.expression, c.searches)
+        self.assertEqual(agg.reducer_name, "exponential_fit")
+        self.assertEqual(agg.reducer_args, [0.5])
+
+    def test_fit_wrong_arity_raises(self):
+        for bad in (
+            "normal_fit([int(ph) for x in population], 30)",  # needs 2
+            "normal_fit([int(ph) for x in population], 30, 5, 1)",
+            "exponential_fit([int(ph) for x in population], 0.5, 1)",  # needs 1
+        ):
+            with self.assertRaises(FandangoValueError):
+                try_parse_population_aggregate(bad, {})
+
+    def test_normal_fit_nonliteral_target_raises(self):
+        with self.assertRaises(FandangoValueError):
+            try_parse_population_aggregate(
+                "normal_fit([int(ph) for x in population], mu, 5)", {}
+            )
 
     # The rejection cases are exercised on crafted (post-substitution) strings so they
     # stay pure unit tests: going through the full parser would raise the same
@@ -157,6 +263,60 @@ class TestConvertTimeRejection(unittest.TestCase):
     def test_population_outside_reducer(self):
         with self.assertRaises(FandangoValueError):
             _parse_objective("minimizing population + 1")
+
+
+class TestRegisterReducer(unittest.TestCase):
+    """The downstream extension point: register a custom reducer/distribution by name."""
+
+    def tearDown(self):
+        # Keep the process-wide registry clean for other tests.
+        REDUCERS.pop("triangular_fit", None)
+        REDUCER_TARGET_ARITY.pop("triangular_fit", None)
+
+    def test_register_and_use_custom_fit(self):
+        # A symmetric triangular distribution on [lo, hi] via its closed-form quantile,
+        # built on the public wasserstein_fit helper — the intended extension recipe.
+        def _tri_quantile(p, lo, hi):
+            mid = (lo + hi) / 2
+            if p < 0.5:
+                return lo + ((hi - lo) * (mid - lo) * p) ** 0.5
+            return hi - ((hi - lo) * (hi - mid) * (1 - p)) ** 0.5
+
+        register_reducer(
+            "triangular_fit",
+            lambda values, lo, hi: wasserstein_fit(values, lambda p: _tri_quantile(p, lo, hi)),
+            target_arity=2,
+        )
+        self.assertIn("triangular_fit", REDUCERS)
+        self.assertEqual(REDUCER_TARGET_ARITY["triangular_fit"], 2)
+
+        # It now parses like any built-in fit, capturing its two target params.
+        c = _parse_objective(
+            "minimizing triangular_fit([int(<age>) for x in population], 0, 100)"
+        )
+        agg = try_parse_population_aggregate(c.expression, c.searches)
+        self.assertEqual(agg.reducer_name, "triangular_fit")
+        self.assertEqual(agg.reducer_args, [0, 100])
+        # On-target samples give ~0 distance.
+        on_target = [_tri_quantile((i + 0.5) / 300, 0, 100) for i in range(300)]
+        self.assertAlmostEqual(
+            REDUCERS["triangular_fit"](on_target, 0, 100), 0.0, places=1
+        )
+
+    def test_zero_arity_reducer_takes_no_target(self):
+        register_reducer("triangular_fit", lambda values: float(len(values)))
+        self.assertNotIn("triangular_fit", REDUCER_TARGET_ARITY)
+        with self.assertRaises(FandangoValueError):
+            # supplying a target param to a 0-arity reducer is an arity error
+            try_parse_population_aggregate(
+                "triangular_fit([int(ph) for x in population], 5)", {}
+            )
+
+    def test_invalid_name_or_arity_rejected(self):
+        with self.assertRaises(FandangoValueError):
+            register_reducer("not an identifier", lambda values: 0.0)
+        with self.assertRaises(FandangoValueError):
+            register_reducer("triangular_fit", lambda values: 0.0, target_arity=-1)
 
 
 def _population_value(objective, attribution):
