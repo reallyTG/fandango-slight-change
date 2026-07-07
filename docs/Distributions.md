@@ -94,6 +94,38 @@ These four built-ins are deliberately a small, standard-library-only *sample*. F
 does not try to ship a full catalogue of distributions; instead it exposes the machinery
 so the tool that embeds Fandango can register exactly the distributions it needs.
 
+### Joint objectives across columns (experimental)
+
+The objectives above steer one column. To steer a *relationship between* columns — the
+kind of joint structure that is everywhere in tabular data — an objective may combine more
+than one field in its inner expression, and it is then evaluated **per row** so the fields
+stay paired:
+
+```
+maximizing correlation((int(<age>), int(<income>)) for x in population)
+```
+
+`correlation` is a joint reducer over the `(age, income)` pairs, one per row, pooled across
+the population; the objective biases the two columns to co-vary. Any objective whose inner
+expression references two or more distinct non-terminals is treated as joint this way (for
+example `minimizing abs(mean(int(<a>) - int(<b>) for x in population) - 5)` steers a
+per-row difference).
+
+```{admonition} How the pairing works — and its limits
+:class: attention
+A single input is a whole table of many rows, so "pair `<age>` with `<income>`" only makes
+sense *within a row*. Fandango infers the row non-terminal automatically — the tightest one
+whose every instance holds exactly one of each referenced field (here `<person>`) — and
+evaluates the inner expression against each such subtree. This is what stops the fields from
+being combined as a meaningless cross product, which would flatten any correlation to zero.
+
+It is a **prototype**, with the same *soft*, best-effort character as the rest of this
+chapter, plus two constraints: the row unit must be inferable (each field appears exactly
+once per row), and joint reducers such as `correlation` are the extension surface — richer
+targets (a joint density via an optimal-transport distance, mutual information, a copula
+fit) plug in through `register_reducer` just like the marginal fits.
+```
+
 ### Adding your own distribution
 
 Each `*_fit` helper is just the shared 1-Wasserstein distance

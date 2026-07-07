@@ -12,6 +12,7 @@ from fandango.constraints.population import (
     REDUCER_TARGET_ARITY,
     REDUCERS,
     PopulationValue,
+    _correlation,
     _count,
     _distinct_count,
     _exponential_fit,
@@ -145,6 +146,7 @@ class TestReducers(unittest.TestCase):
                 "fraction",
                 "distinct_count",
                 "count",
+                "correlation",
                 "normal_fit",
                 "lognormal_fit",
                 "uniform_fit",
@@ -317,6 +319,74 @@ class TestRegisterReducer(unittest.TestCase):
             register_reducer("not an identifier", lambda values: 0.0)
         with self.assertRaises(FandangoValueError):
             register_reducer("triangular_fit", lambda values: 0.0, target_arity=-1)
+
+
+JOINT_GRAMMAR = """<start> ::= <person> "\\n" <person> "\\n" <person>
+<person> ::= <age> "," <income>
+<age> ::= <digit> <digit>
+<income> ::= <digit> <digit>
+<digit> ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
+"""
+
+
+def _parse_joint(objective):
+    spec = JOINT_GRAMMAR + "\n" + objective + "\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".fan", delete=False) as f:
+        f.write(spec)
+        path = f.name
+    try:
+        with open(path) as f:
+            grammar, constraints = parse(f, use_stdlib=False, use_cache=False)
+    finally:
+        Path(path).unlink(missing_ok=True)
+    return grammar, constraints[0]
+
+
+class TestJointRowScoping(unittest.TestCase):
+    """Prototype: an objective combining >= 2 fields is paired *per row*, not
+    cross-producted over the whole tree (which would destroy every joint statistic)."""
+
+    def _pv(self, objective):
+        grammar, c = _parse_joint(objective)
+        agg = try_parse_population_aggregate(c.expression, c.searches)
+        pv = PopulationValue(
+            c.optimization_goal,
+            c.expression,
+            aggregate=agg,
+            local_variables=c.local_variables,
+            global_variables=c.global_variables,
+        )
+        return grammar, pv
+
+    def test_marginal_stays_tree_scoped(self):
+        _, pv = self._pv("minimizing abs(mean(int(<age>) for x in population) - 30)")
+        self.assertFalse(pv._row_scoped)
+
+    def test_joint_pairs_row_wise_not_cross_product(self):
+        grammar, pv = self._pv(
+            "maximizing correlation((int(<age>), int(<income>)) for x in population)"
+        )
+        self.assertTrue(pv._row_scoped)
+        self.assertEqual(pv._target_symbols, ["<age>", "<income>"])
+        tree = grammar.parse("10,90\n20,80\n30,70")
+        per_tree = pv._inner_values_per_tree([tree])
+        # The diagonal (3 aligned pairs), NOT the 9-element cross product.
+        self.assertEqual(per_tree, [[(10, 90), (20, 80), (30, 70)]])
+        self.assertEqual(str(pv._row_symbol), "<person>")
+
+    def test_correlation_recovered_not_destroyed(self):
+        grammar, pv = self._pv(
+            "maximizing correlation((int(<age>), int(<income>)) for x in population)"
+        )
+        tree = grammar.parse("10,90\n20,80\n30,70")  # perfectly negative row-wise
+        vals = [v for vs in pv._inner_values_per_tree([tree]) for v in vs]
+        # Row-wise this is -1.0; a cross product would report ~0.0.
+        self.assertAlmostEqual(pv._outer_score(vals), -1.0, places=6)
+
+    def test_correlation_reducer_rejects_non_pairs(self):
+        with self.assertRaises(FandangoValueError):
+            _correlation([1, 2, 3])
+        self.assertEqual(_correlation([(1, 2)]), 0.0)  # < 2 pairs -> undefined -> 0.0
 
 
 def _population_value(objective, attribution):

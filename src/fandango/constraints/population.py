@@ -20,7 +20,7 @@ import ast
 import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from statistics import NormalDist
+from statistics import NormalDist, StatisticsError, correlation
 from typing import Any, Optional
 
 from fandango.constraints.fitness import ValueFitness
@@ -61,6 +61,35 @@ def _distinct_count(values: list[Any]) -> int:
 
 def _count(values: list[Any]) -> int:
     return len(values)
+
+
+def _correlation(pairs: list[Any]) -> float:
+    """Pearson correlation of a list of ``(x, y)`` pairs — a *joint* reducer.
+
+    Its inner expression yields one pair per row, e.g.
+    ``correlation((int(<age>), int(<income>)) for x in population)``. That only works
+    because the objective is evaluated row-by-row rather than cross-producted over the
+    whole tree; see the row-scoping note on :class:`PopulationValue`. Returns 0.0 when
+    the correlation is undefined (fewer than two pairs, or a column has no variance)."""
+    xs: list[float] = []
+    ys: list[float] = []
+    for p in pairs:
+        try:
+            a, b = p
+        except (TypeError, ValueError):
+            raise FandangoValueError(
+                "correlation expects a joint inner expression yielding (x, y) pairs, "
+                "e.g. correlation((int(<age>), int(<income>)) for x in population); "
+                f"got {p!r}."
+            )
+        xs.append(float(a))
+        ys.append(float(b))
+    if len(xs) < 2:
+        return 0.0
+    try:
+        return correlation(xs, ys)
+    except StatisticsError:  # a constant column has no correlation
+        return 0.0
 
 
 # --- distributional-fit reducers ------------------------------------------- #
@@ -127,6 +156,7 @@ REDUCERS: dict[str, Callable[..., float]] = {
     "fraction": _fraction,
     "distinct_count": _distinct_count,
     "count": _count,
+    "correlation": _correlation,
     "normal_fit": _normal_fit,
     "lognormal_fit": _lognormal_fit,
     "uniform_fit": _uniform_fit,
@@ -223,6 +253,29 @@ class _InnerValue(Value):
 
     def format_as_spec(self) -> str:
         return self.expression
+
+    def raw_values(
+        self,
+        tree: DerivationTree,
+        scope: Optional[dict[Any, DerivationTree]] = None,
+        local_variables: Optional[dict[str, Any]] = None,
+    ) -> list[Any]:
+        """The per-combination results of the inner expression as raw Python objects.
+
+        Mirrors :meth:`Value.fitness`'s evaluation loop but returns the results directly
+        instead of wrapping them in a numeric :class:`ValueFitness` — a *joint* inner
+        expression yields tuples (e.g. ``(age, income)``), which are not fitness numbers.
+        """
+        results: list[Any] = []
+        for combination in self.combinations(tree, scope):
+            local_vars = self.local_variables.copy()
+            if local_variables:
+                local_vars.update(local_variables)
+            local_vars.update(
+                {name: container.evaluate() for name, container in combination}
+            )
+            results.append(eval(self.expression, self.global_variables, local_vars))
+        return results
 
 
 class _AggregateReplacer(ast.NodeTransformer):
@@ -417,6 +470,22 @@ class PopulationValue(SoftValue):
             local_variables=self.local_variables,
             global_variables=self.global_variables,
         )
+        # Row-scoping (prototype). When the inner expression combines >= 2 distinct
+        # non-terminals it is a *joint* objective: the fields must be paired within a row,
+        # not cross-producted over the whole tree (which would destroy every joint
+        # statistic — corr(x, y) collapses to 0). We then evaluate the inner expression
+        # against each *row* subtree instead. The row non-terminal is the tightest one
+        # whose every instance holds exactly one match of each field; it is inferred from
+        # the first population and cached in `_row_symbol`.
+        self._target_symbols = sorted(
+            {
+                str(nt)
+                for s in aggregate.inner_searches.values()
+                for nt in s.get_access_points()
+            }
+        )
+        self._row_scoped = len(self._target_symbols) >= 2
+        self._row_symbol: Optional[Any] = None
 
     def fitness(self, tree, scope=None, local_variables=None) -> ValueFitness:  # type: ignore[override]
         """Neutral per-tree contract.
@@ -432,13 +501,62 @@ class PopulationValue(SoftValue):
     def _inner_values_per_tree(
         self, population: list[DerivationTree]
     ) -> list[list[Any]]:
-        """The raw inner values for each individual (a tree may yield several)."""
+        """The raw inner values for each individual (a tree may yield several).
+
+        For a marginal objective the inner expression is evaluated once against the whole
+        tree. For a *joint* (row-scoped) objective it is evaluated once per row subtree,
+        so multiple fields stay paired; see :meth:`_infer_row_symbol`.
+        """
         per_tree: list[list[Any]] = []
         for tree in population:
-            extra = {self.aggregate.loop_var: tree}
-            values = self._inner_value.fitness(tree, local_variables=extra).values
-            per_tree.append(list(values))
+            if self._row_scoped:
+                per_tree.append(self._row_scoped_values(tree))
+            else:
+                extra = {self.aggregate.loop_var: tree}
+                values = self._inner_value.fitness(tree, local_variables=extra).values
+                per_tree.append(list(values))
         return per_tree
+
+    def _row_scoped_values(self, tree: DerivationTree) -> list[Any]:
+        """One inner value per row of ``tree``, evaluating the inner expression against
+        each row subtree so its fields are paired row-wise instead of cross-producted."""
+        if self._row_symbol is None:
+            self._row_symbol = self._infer_row_symbol(tree)
+        if self._row_symbol is None:
+            # No non-terminal partitions the fields one-per-row; we cannot align them, so
+            # emit no signal for this tree rather than silently cross-producting.
+            LOGGER.warning(
+                f"Could not infer a row non-terminal pairing {self._target_symbols} for "
+                f"joint objective {self.format_as_spec()}; skipping this individual."
+            )
+            return []
+        row_values: list[Any] = []
+        for row in tree.find_subtrees(self._row_symbol):
+            extra = {self.aggregate.loop_var: row}
+            row_values.extend(self._inner_value.raw_values(row, local_variables=extra))
+        return row_values
+
+    def _infer_row_symbol(self, tree: DerivationTree) -> Optional[Any]:
+        """The tightest non-terminal whose every subtree holds exactly one match of each
+        target field — i.e. one table row. Returns ``None`` if none qualifies."""
+        searches = list(self.aggregate.inner_searches.values())
+        best: Optional[tuple[int, Any]] = None
+        seen: set[str] = set()
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children)
+            if not node.symbol.is_non_terminal or str(node.symbol) in seen:
+                continue
+            seen.add(str(node.symbol))
+            rows = list(tree.find_subtrees(node.symbol))
+            if not rows:
+                continue
+            if all(len(s.find(row)) == 1 for row in rows for s in searches):
+                # Tightest = most rows (each holding exactly one of every field).
+                if best is None or len(rows) > best[0]:
+                    best = (len(rows), node.symbol)
+        return best[1] if best else None
 
     # -- aggregate -> outer score ------------------------------------------ #
     def _outer_score(self, values: Iterable[Any]) -> float:
