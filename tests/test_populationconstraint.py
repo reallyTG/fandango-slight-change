@@ -1,0 +1,381 @@
+#!/usr/bin/env pytest
+"""Unit tests for Mechanism A step 1: the population objective parser, reducers, and
+`PopulationValue` attribution. No evaluator wiring is exercised here."""
+
+import re
+import statistics
+import tempfile
+import unittest
+from pathlib import Path
+
+from fandango.constraints.population import (
+    REDUCERS,
+    PopulationValue,
+    _count,
+    _distinct_count,
+    _fraction,
+    _mean,
+    _stddev,
+    try_parse_population_aggregate,
+)
+from fandango.errors import FandangoValueError
+from fandango.evolution.algorithm import DefaultAlgorithm, LoggerLevel
+from fandango.language.parse.parse import parse
+
+from .utils import RESOURCES_ROOT
+
+GRAMMAR = """<start> ::= <person>+
+<person> ::= <name> "," <age> "\\n"
+<name> ::= r'[a-z]+'
+<age> ::= r'[0-9]+'
+"""
+
+
+def _parse_spec(objective: str):
+    """Parse GRAMMAR + a single objective line, returning (grammar, soft constraint)."""
+    spec = GRAMMAR + "\n" + objective + "\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".fan", delete=False) as f:
+        f.write(spec)
+        path = f.name
+    try:
+        with open(path) as f:
+            grammar, constraints = parse(f, use_stdlib=False, use_cache=False)
+    finally:
+        Path(path).unlink(missing_ok=True)
+    assert constraints
+    return grammar, constraints[0]
+
+
+def _parse_objective(objective: str):
+    return _parse_spec(objective)[1]
+
+
+def _real_population(grammar, n):
+    """A population of real DerivationTrees (needed to satisfy runtime type checks);
+    the contents are irrelevant when `_inner_values_per_tree` is stubbed."""
+    import random
+
+    random.seed(0)
+    return [grammar.fuzz() for _ in range(n)]
+
+
+class TestReducers(unittest.TestCase):
+    def test_mean(self):
+        self.assertEqual(_mean([10, 20, 30]), 20)
+        self.assertEqual(_mean([]), 0.0)
+
+    def test_stddev(self):
+        self.assertEqual(_stddev([]), 0.0)
+        self.assertEqual(_stddev([5]), 0.0)  # < 2 values
+        self.assertAlmostEqual(_stddev([2, 4, 6]), 1.632993, places=5)
+
+    def test_fraction(self):
+        self.assertEqual(_fraction([True, False, True, False]), 0.5)
+        self.assertEqual(_fraction([]), 0.0)
+
+    def test_distinct_count(self):
+        self.assertEqual(_distinct_count([1, 1, 2, 3, 3]), 3)
+
+    def test_count(self):
+        self.assertEqual(_count([1, 1, 2]), 3)
+
+    def test_registry(self):
+        self.assertEqual(
+            set(REDUCERS), {"mean", "stddev", "fraction", "distinct_count", "count"}
+        )
+
+
+class TestParsePopulationAggregate(unittest.TestCase):
+    def test_accepts_mean(self):
+        c = _parse_objective("minimizing abs(mean(int(<age>) for x in population) - 30)")
+        agg = try_parse_population_aggregate(c.expression, c.searches)
+        self.assertIsNotNone(agg)
+        self.assertEqual(agg.reducer_name, "mean")
+        self.assertEqual(agg.loop_var, "x")
+        # inner has exactly the referenced search; outer replaces the reducer call.
+        self.assertEqual(len(agg.inner_searches), 1)
+        self.assertIn(next(iter(agg.inner_searches)), agg.inner_expression)
+        self.assertIn("___fandango_population_agg___", agg.outer_expression)
+        # the generator over `population` is gone from the outer expression.
+        self.assertNotIn("for x in population", agg.outer_expression)
+        self.assertNotIn("mean", agg.outer_expression)
+
+    def test_accepts_distinct_count(self):
+        c = _parse_objective("maximizing distinct_count(<age> for x in population)")
+        agg = try_parse_population_aggregate(c.expression, c.searches)
+        self.assertIsNotNone(agg)
+        self.assertEqual(agg.reducer_name, "distinct_count")
+
+    def test_accepts_listcomp(self):
+        c = _parse_objective(
+            "minimizing abs(mean([int(<age>) for x in population]) - 30)"
+        )
+        agg = try_parse_population_aggregate(c.expression, c.searches)
+        self.assertIsNotNone(agg)
+        self.assertEqual(agg.reducer_name, "mean")
+
+    def test_non_population_returns_none(self):
+        c = _parse_objective("minimizing int(<age>)")
+        self.assertIsNone(try_parse_population_aggregate(c.expression, c.searches))
+
+    # The rejection cases are exercised on crafted (post-substitution) strings so they
+    # stay pure unit tests: going through the full parser would raise the same
+    # FandangoValueError at convert time (see TestConvertTimeRejection), before we could
+    # call try_parse_population_aggregate directly.
+    # These reject-paths fire before the searches dict is consulted, so an empty dict
+    # is enough (and keeps the runtime type checker happy).
+    def test_unknown_reducer_raises(self):
+        with self.assertRaises(FandangoValueError):
+            try_parse_population_aggregate(
+                "median(int(ph) for x in population)", {}
+            )
+
+    def test_multiple_aggregates_raise(self):
+        with self.assertRaises(FandangoValueError):
+            try_parse_population_aggregate(
+                "mean(a for x in population) - count(b for x in population)", {}
+            )
+
+    def test_filter_raises(self):
+        with self.assertRaises(FandangoValueError):
+            try_parse_population_aggregate(
+                "mean(int(ph) for x in population if ph)", {}
+            )
+
+    def test_population_outside_reducer_raises(self):
+        with self.assertRaises(FandangoValueError):
+            try_parse_population_aggregate("population + 1", {})
+
+
+class TestConvertTimeRejection(unittest.TestCase):
+    """Malformed population objectives surface at parse/convert time."""
+
+    def test_unknown_reducer(self):
+        with self.assertRaises(FandangoValueError):
+            _parse_objective("minimizing median(int(<age>) for x in population)")
+
+    def test_population_outside_reducer(self):
+        with self.assertRaises(FandangoValueError):
+            _parse_objective("minimizing population + 1")
+
+
+def _population_value(objective, attribution):
+    grammar, c = _parse_spec(objective)
+    agg = try_parse_population_aggregate(c.expression, c.searches)
+    pv = PopulationValue(
+        c.optimization_goal,
+        c.expression,
+        aggregate=agg,
+        attribution=attribution,
+        local_variables=c.local_variables,
+        global_variables=c.global_variables,
+    )
+    return pv, grammar
+
+
+class TestPopulationValueAttribution(unittest.TestCase):
+    OBJECTIVE = "minimizing abs(mean(int(<age>) for x in population) - 30)"
+
+    def test_bad_attribution_raises(self):
+        with self.assertRaises(FandangoValueError):
+            _population_value(self.OBJECTIVE, "nonsense")
+
+    def test_neutral_per_tree_fitness(self):
+        pv, grammar = _population_value(self.OBJECTIVE, "loo")
+        self.assertEqual(pv.fitness(grammar.fuzz()).values, [])
+
+    def test_empty_population(self):
+        pv, _ = _population_value(self.OBJECTIVE, "loo")
+        self.assertEqual(pv.evaluate_population([]), [])
+
+    def test_uniform_is_flat(self):
+        pv, grammar = _population_value(self.OBJECTIVE, "uniform")
+        # stub the per-tree inner values so the test is deterministic.
+        pv._inner_values_per_tree = lambda pop: [[30], [10], [90], [50]]
+        bonuses = pv.evaluate_population(_real_population(grammar, 4))
+        self.assertEqual(len(bonuses), 4)
+        self.assertEqual(len(set(bonuses)), 1)  # every individual identical
+
+    def test_loo_rewards_the_helper(self):
+        # mean target is 30; individual 0 sits exactly on target, the rest are far off,
+        # so removing individual 0 pushes the mean furthest from 30 -> highest reward.
+        pv, grammar = _population_value(self.OBJECTIVE, "loo")
+        pv._inner_values_per_tree = lambda pop: [[30], [100], [100], [100]]
+        bonuses = pv.evaluate_population(_real_population(grammar, 4))
+        self.assertEqual(len(bonuses), 4)
+        self.assertEqual(bonuses[0], max(bonuses))
+        self.assertGreater(bonuses[0], bonuses[1])
+        # the three equally-unhelpful individuals tie.
+        self.assertEqual(bonuses[1], bonuses[2])
+        self.assertEqual(bonuses[2], bonuses[3])
+
+    def test_loo_no_inner_values_returns_zeros(self):
+        pv, grammar = _population_value(self.OBJECTIVE, "loo")
+        pv._inner_values_per_tree = lambda pop: [[], [], []]
+        self.assertEqual(
+            pv.evaluate_population(_real_population(grammar, 3)), [0.0, 0.0, 0.0]
+        )
+
+    def test_maximize_distinct_count_ranks_unique_contributor(self):
+        pv, grammar = _population_value(
+            "maximizing distinct_count(int(<age>) for x in population)", "loo"
+        )
+        # individuals 1..3 are duplicates; individual 0 is the only unique value, so
+        # removing it drops the distinct count the most -> it is the top contributor.
+        pv._inner_values_per_tree = lambda pop: [[7], [5], [5], [5]]
+        bonuses = pv.evaluate_population(_real_population(grammar, 4))
+        self.assertEqual(bonuses[0], max(bonuses))
+
+
+class TestPopulationEndToEnd(unittest.TestCase):
+    """End-to-end: the objective must steer the population distribution relative to the
+    same grammar run *without* it. These are soft, best-effort objectives, so we assert
+    a clear directional shift rather than exact convergence."""
+
+    GENERATIONS = 100
+    POPULATION_SIZE = 40
+    SEED = 1
+
+    def _final_population(self, spec_file, *, with_objective):
+        with open(spec_file) as f:
+            grammar, constraints = parse(f, use_stdlib=False, use_cache=False)
+        fandango = DefaultAlgorithm(
+            grammar=grammar,
+            constraints=constraints if with_objective else [],
+            random_seed=self.SEED,
+            logger_level=LoggerLevel.ERROR,
+            population_size=self.POPULATION_SIZE,
+        )
+        # Drain the generator so the GA runs the full generation budget; we inspect the
+        # final working set rather than the (immediately-satisfied) solution stream.
+        list(fandango.generate(max_generations=self.GENERATIONS))
+        return fandango.population
+
+    @staticmethod
+    def _numbers(trees):
+        values = []
+        for tree in trees:
+            values.extend(int(m) for m in re.findall(r"\d\d", str(tree)))
+        return values
+
+    def test_mean_converges_toward_target(self):
+        target = 30
+        base = self._numbers(
+            self._final_population(
+                RESOURCES_ROOT / "population_mean.fan", with_objective=False
+            )
+        )
+        opt = self._numbers(
+            self._final_population(
+                RESOURCES_ROOT / "population_mean.fan", with_objective=True
+            )
+        )
+        base_mean, opt_mean = statistics.mean(base), statistics.mean(opt)
+        # The objective should pull the mean clearly closer to the target than baseline.
+        self.assertLess(
+            abs(opt_mean - target),
+            abs(base_mean - target) - 2.0,
+            f"objective mean {opt_mean:.1f} not meaningfully closer to {target} "
+            f"than baseline {base_mean:.1f}",
+        )
+
+    def test_maximizing_pushes_mean_up(self):
+        # Exercises the "max" goal path: the mean should end up clearly above the
+        # no-objective baseline (which hovers around the uniform midpoint ~49.5).
+        base = statistics.mean(
+            self._numbers(
+                self._final_population(
+                    RESOURCES_ROOT / "population_maximize.fan", with_objective=False
+                )
+            )
+        )
+        opt = statistics.mean(
+            self._numbers(
+                self._final_population(
+                    RESOURCES_ROOT / "population_maximize.fan", with_objective=True
+                )
+            )
+        )
+        self.assertGreater(
+            opt,
+            base + 4.0,
+            f"maximizing mean {opt:.1f} not clearly above baseline {base:.1f}",
+        )
+
+
+class TestAttributionKnob(unittest.TestCase):
+    """The run-level population_attribution override (constructor + CLI plumbing)."""
+
+    OBJECTIVE = "minimizing abs(mean(int(<age>) for x in population) - 30)"
+
+    def _grammar_and_constraints(self):
+        spec = GRAMMAR + "\n" + self.OBJECTIVE + "\n"
+        with tempfile.NamedTemporaryFile("w", suffix=".fan", delete=False) as f:
+            f.write(spec)
+            path = f.name
+        try:
+            with open(path) as f:
+                grammar, constraints = parse(f, use_stdlib=False, use_cache=False)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        return grammar, constraints
+
+    def test_evaluator_applies_override(self):
+        from fandango.evolution.evaluation import Evaluator
+
+        grammar, constraints = self._grammar_and_constraints()
+        # objectives default to "loo" at convert time...
+        self.assertEqual(constraints[0].attribution, "loo")
+        # ...and the run-level knob overrides them when the evaluator is built.
+        evaluator = Evaluator(
+            grammar,
+            constraints,
+            expected_fitness=1.0,
+            diversity_k=0,
+            diversity_weight=0.0,
+            population_attribution="uniform",
+        )
+        self.assertEqual(len(evaluator._population_constraints), 1)
+        self.assertEqual(evaluator._population_constraints[0].attribution, "uniform")
+
+    def test_evaluator_rejects_bad_override(self):
+        from fandango.evolution.evaluation import Evaluator
+
+        grammar, constraints = self._grammar_and_constraints()
+        with self.assertRaises(ValueError):
+            Evaluator(
+                grammar,
+                constraints,
+                expected_fitness=1.0,
+                diversity_k=0,
+                diversity_weight=0.0,
+                population_attribution="nonsense",
+            )
+
+    def test_cli_flag_flows_into_settings(self):
+        from fandango.cli.parser import get_parser
+        from fandango.cli.utils import make_fandango_settings
+
+        parser = get_parser()
+        args = parser.parse_args(
+            ["fuzz", "-f", str(RESOURCES_ROOT / "population_mean.fan"),
+             "--population-attribution", "uniform"]
+        )
+        settings = make_fandango_settings(args)
+        self.assertEqual(settings.get("population_attribution"), "uniform")
+
+    def test_cli_flag_absent_by_default(self):
+        from fandango.cli.parser import get_parser
+        from fandango.cli.utils import make_fandango_settings
+
+        parser = get_parser()
+        args = parser.parse_args(
+            ["fuzz", "-f", str(RESOURCES_ROOT / "population_mean.fan")]
+        )
+        settings = make_fandango_settings(args)
+        # Not set -> the constructor default ("loo") applies.
+        self.assertNotIn("population_attribution", settings)
+
+
+if __name__ == "__main__":
+    unittest.main()
