@@ -50,6 +50,7 @@ class GeneticAlgorithm(ABC):
         start_symbol: str = "<start>",
         diversity_k: int = 5,
         diversity_weight: float = 1.0,
+        population_attribution: str = "loo",
         max_repetition_rate: float = 0.5,
         max_repetitions: Optional[int] = None,
         max_nodes: int = 200,

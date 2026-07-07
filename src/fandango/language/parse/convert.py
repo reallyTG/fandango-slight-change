@@ -14,6 +14,10 @@ from fandango.constraints.expression import ExpressionConstraint
 from fandango.constraints.failing_tree import Comparison
 from fandango.constraints.forall import ForallConstraint
 from fandango.constraints.repetition_bounds import RepetitionBoundsConstraint
+from fandango.constraints.population import (
+    PopulationValue,
+    try_parse_population_aggregate,
+)
 from fandango.constraints.soft import SoftValue
 from fandango.errors import FandangoValueError
 from fandango.language import NodeType, NonTerminalSearch
@@ -354,6 +358,20 @@ class ConstraintProcessor(FandangoParserVisitor):
         elif ctx.MINIMIZING() or ctx.MAXIMIZING():
             expression_constraint = self.visitExpr(ctx.expr())
             optimization_goal = "min" if ctx.MINIMIZING() else "max"
+            # A soft objective becomes population-level when it aggregates over the
+            # reserved `population` binder (Mechanism A); otherwise it is an ordinary
+            # per-tree soft value.
+            aggregate = try_parse_population_aggregate(
+                expression_constraint.expression, expression_constraint.searches
+            )
+            if aggregate is not None:
+                return PopulationValue(
+                    optimization_goal,
+                    expression_constraint.expression,
+                    aggregate=aggregate,
+                    local_variables=expression_constraint.local_variables,
+                    global_variables=expression_constraint.global_variables,
+                )
             return SoftValue(
                 optimization_goal,
                 expression_constraint.expression,

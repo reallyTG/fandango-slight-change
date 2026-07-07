@@ -62,6 +62,7 @@ class SimpleGeneticAlgorithm(GeneticAlgorithm):
         start_symbol: str = "<start>",
         diversity_k: int = 5,
         diversity_weight: float = 1.0,
+        population_attribution: str = "loo",
         max_repetition_rate: float = 0.5,
         max_repetitions: Optional[int] = None,
         max_nodes: int = 200,
@@ -115,6 +116,7 @@ class SimpleGeneticAlgorithm(GeneticAlgorithm):
                 diversity_k,
                 diversity_weight,
                 warnings_are_errors,
+                population_attribution=population_attribution,
             )
         else:
             self.population_manager = PopulationManager(
@@ -133,6 +135,7 @@ class SimpleGeneticAlgorithm(GeneticAlgorithm):
                 use_fcc,
                 put,
                 put_args,
+                population_attribution=population_attribution,
             )
         self.adaptive_tuner = AdaptiveTuner(
             mutation_rate,

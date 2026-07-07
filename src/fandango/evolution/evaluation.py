@@ -12,6 +12,7 @@ from fandango.constraints.failing_tree import (
     NopSuggestion,
     Suggestion,
 )
+from fandango.constraints.population import PopulationValue
 from fandango.constraints.repetition_bounds import RepetitionBoundsConstraint
 from fandango.constraints.soft import SoftValue
 from fandango.evolution import GeneratorWithReturn
@@ -36,9 +37,17 @@ class Evaluator:
         use_fcc: bool = False,
         put: Optional[str] = None,
         put_args: Optional[list[str]] = None,
+        population_attribution: str = "loo",
     ):
+        if population_attribution not in PopulationValue.ATTRIBUTIONS:
+            raise ValueError(
+                f"Unknown population_attribution {population_attribution!r}; "
+                f"expected one of {PopulationValue.ATTRIBUTIONS}."
+            )
+        self._population_attribution = population_attribution
         self._grammar = grammar
         self._soft_constraints: list[SoftValue] = []
+        self._population_constraints: list[PopulationValue] = []
         self._hard_constraints: list[Constraint] = []
         self._repetition_bounds_constraints: list[RepetitionBoundsConstraint] = []
         self._expected_fitness = expected_fitness
@@ -67,7 +76,14 @@ class Evaluator:
                 constraint.global_variables["DynamicAnalysis"] = (
                     self.fcc.dynamic_analysis.trace_input
                 )
-            if isinstance(constraint, SoftValue):
+            if isinstance(constraint, PopulationValue):
+                # PopulationValue subclasses SoftValue, so it must be routed first.
+                # Apply the run-level attribution override (defaults to the objective's
+                # own "loo"). If per-objective attribution syntax is ever added at parse
+                # time, this global knob would take precedence over it.
+                constraint.attribution = self._population_attribution
+                self._population_constraints.append(constraint)
+            elif isinstance(constraint, SoftValue):
                 self._soft_constraints.append(constraint)
             elif isinstance(constraint, RepetitionBoundsConstraint):
                 self._repetition_bounds_constraints.append(constraint)
@@ -223,6 +239,36 @@ class Evaluator:
         soft_fitness /= len(self._soft_constraints)
         return soft_fitness, failing_trees
 
+    def _evaluate_population_constraints(
+        self, population: list[DerivationTree]
+    ) -> list[float]:
+        """A per-individual bonus vector for the population-level (Mechanism A) soft
+        objectives, in population order.
+
+        Each :class:`PopulationValue` scores the whole working set at once and attributes
+        a bonus back to every individual; we sum across objectives and average by their
+        count, mirroring the ``/= len(...)`` normalization used elsewhere. The result is
+        folded into fitness in :meth:`evaluate_population`, structurally like the
+        diversity bonus.
+        """
+        n = len(population)
+        if not self._population_constraints or n == 0:
+            return [0.0] * n
+
+        total = [0.0] * n
+        for constraint in self._population_constraints:
+            try:
+                bonuses = constraint.evaluate_population(population)
+            except Exception as e:
+                LOGGER.error(
+                    f"Error evaluating population constraint "
+                    f"{constraint.format_as_spec()}: {e}"
+                )
+                continue
+            for i, bonus in enumerate(bonuses):
+                total[i] += bonus
+        return [t / len(self._population_constraints) for t in total]
+
     def evaluate_individual(
         self,
         individual: DerivationTree,
@@ -304,6 +350,19 @@ class Evaluator:
                     evaluation, bonuses, strict=False
                 )
             ]
+
+        # Population-level soft objectives (Mechanism A) are evaluated once per
+        # generation over the whole working set and folded in like the diversity bonus.
+        # They deliberately bypass the per-individual `_fitness_cache` (their aggregate
+        # shifts as the set evolves), so no cache flush is needed for them.
+        if self._population_constraints:
+            pop_bonuses = self._evaluate_population_constraints(population)
+            evaluation = [
+                (ind, fitness + bonus, failing_trees, suggestion)
+                for (ind, fitness, failing_trees, suggestion), bonus in zip(
+                    evaluation, pop_bonuses, strict=False
+                )
+            ]
         return evaluation
 
     def select_elites(
@@ -345,6 +404,7 @@ class IoEvaluator(Evaluator):
         diversity_k: int,
         diversity_weight: float,
         warnings_are_errors: bool = False,
+        population_attribution: str = "loo",
     ):
         super().__init__(
             grammar,
@@ -353,10 +413,18 @@ class IoEvaluator(Evaluator):
             diversity_k,
             diversity_weight,
             warnings_are_errors,
+            population_attribution=population_attribution,
         )
         self._submitted_solutions: set[int] = set()
         self._hold_back_solutions: set[DerivationTree] = set()
         self._past_trees: list[DerivationTree] = []
+        if self._population_constraints:
+            # The IO/protocol path has its own evaluate_population override that does not
+            # fold in population bonuses; declare it unsupported in v1 (Mechanism A).
+            LOGGER.warning(
+                "Population-level soft objectives are not supported on the IO/protocol "
+                "path yet; they will be ignored."
+            )
 
     def get_past_msgs(
         self, packet_type: Optional[PacketNonTerminal] = None

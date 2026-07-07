@@ -216,6 +216,14 @@ def _get_algorithm_parser() -> argparse.ArgumentParser:
         default=None,
     )
     algorithm_group.add_argument(
+        "--population-attribution",
+        choices=["loo", "uniform"],
+        help="How a population-level soft objective's aggregate score is attributed back "
+        "to individuals: 'loo' (leave-one-out, rewards individuals that pull the "
+        "aggregate toward the goal) or 'uniform' (same score for all).",
+        default=None,
+    )
+    algorithm_group.add_argument(
         "--random-seed",
         type=int,
         help="Random seed to use for the algorithm. You probably also want to specify 'PYTHONHASHSEED=<some-value>' to achieve full reproducibility.",

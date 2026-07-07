@@ -83,6 +83,7 @@ def make_fandango_settings(
     LOGGER.debug(f"Pre-sanitized settings: {args}")
     settings = initial_settings.copy() if initial_settings is not None else {}
     _copy_setting(args, settings, "population_size")
+    _copy_setting(args, settings, "population_attribution")
     _copy_setting(args, settings, "mutation_rate")
     _copy_setting(args, settings, "crossover_rate")
     _copy_setting(args, settings, "elitism_rate")
