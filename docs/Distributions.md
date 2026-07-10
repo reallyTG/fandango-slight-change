@@ -150,14 +150,32 @@ after which a spec can use it exactly like a built-in:
 minimizing gamma_fit([int(<amount>) for x in population], 2.0, 10.0)
 ```
 
-`register_reducer(name, reducer, *, target_arity=0)` adds `reducer(values, *target_params)`
-to the registry under `name`; `target_arity` is how many trailing literal arguments the
-objective supplies (the distribution's parameters). Any reducer that returns a float works
-— it need not be a distributional fit — but for one that is, `wasserstein_fit` + a quantile
-function is the whole recipe. Closed-form quantiles (logistic, Weibull, Pareto, triangular,
-…) are one-liners; distributions without one (gamma, beta) come for free through
-`scipy.stats.<dist>.ppf`, which is why the richer catalogue is best kept in the
-Scipy-carrying downstream rather than here.
+`register_reducer(name, reducer, *, target_arity=0, marginal=None)` adds
+`reducer(values, *target_params)` to the registry under `name`; `target_arity` is how many
+trailing literal arguments the objective supplies (the distribution's parameters). Any
+reducer that returns a float works — it need not be a distributional fit — but for one that
+is, `wasserstein_fit` + a quantile function is the whole recipe. Closed-form quantiles
+(logistic, Weibull, Pareto, triangular, …) are one-liners; distributions without one (gamma,
+beta) come for free through `scipy.stats.<dist>.ppf`, which is why the richer catalogue is
+best kept in the Scipy-carrying downstream rather than here.
+
+For a distributional fit, prefer `register_distribution_fit`, which wires **both** the
+reducer and its `marginal` companion (see [Attribution](#attribution)) from a single
+quantile — so your distribution gets the sharper `marginal` gradient for free:
+
+```python
+from scipy.stats import gamma
+from fandango.constraints.population import register_distribution_fit
+
+register_distribution_fit(
+    "gamma_fit",
+    lambda a, scale: lambda p: gamma.ppf(p, a, scale=scale),
+    target_arity=2,
+)
+```
+
+The lower-level `register_reducer` also takes an optional `marginal=` companion directly; omit
+it and objectives using that reducer simply fall back to `loo` attribution.
 
 ```{admonition} Bracket the generator when a helper takes target parameters
 :class: note
@@ -181,12 +199,23 @@ per-individual contribution. How that one number is spread back onto individuals
 _attribution_ — is what determines how strongly the objective steers:
 
 * **`loo`** (leave-one-out, the default) rewards each input by how much _including_ it
-  moves the aggregate toward the goal. This gives a real selection gradient.
+  moves the aggregate toward the goal, by re-evaluating the aggregate over the population
+  minus that input. This gives a real selection gradient, at O(n) re-aggregations.
+* **`marginal`** is a cheaper, sharper O(N) approximation of `loo`: instead of
+  re-aggregating, it asks the reducer for each value's analytic removal influence and scores
+  the objective at the linearly-perturbed aggregate. It is available for every reducer that
+  ships a `marginal` companion (all the built-ins except `correlation`, plus anything added
+  via `register_distribution_fit`), and falls back to `loo` for the rest. In practice it
+  steers _location_ objectives (e.g. `mean`) a little harder than `loo` and is roughly on par
+  elsewhere. Note it cannot, on its own, tighten a distribution's _spread_: selection acts on
+  whole inputs, and spread is a property of the pooled values rather than of any one input —
+  so both `marginal` and `loo` shift where the distribution sits more readily than how wide
+  it is.
 * **`uniform`** gives every input the same score. It creates no gradient _between_ inputs,
   so it barely steers; it is mainly useful as a baseline for comparison.
 
-Select the mode with the `--population-attribution {loo,uniform}` command-line flag (or the
-`population_attribution` constructor argument):
+Select the mode with the `--population-attribution {loo,marginal,uniform}` command-line flag
+(or the `population_attribution` constructor argument):
 
 ```shell
 $ fandango fuzz -f persons.fan --population-attribution loo

@@ -15,8 +15,10 @@ from fandango.constraints.failing_tree import Comparison
 from fandango.constraints.forall import ForallConstraint
 from fandango.constraints.repetition_bounds import RepetitionBoundsConstraint
 from fandango.constraints.population import (
+    PopulationRequirement,
     PopulationValue,
     try_parse_population_aggregate,
+    try_parse_population_requirement,
 )
 from fandango.constraints.soft import SoftValue
 from fandango.errors import FandangoValueError
@@ -323,6 +325,7 @@ class ConstraintProcessor(FandangoParserVisitor):
         global_variables: Optional[dict[str, Any]] = None,
         lazy: bool = False,
     ):
+        self.grammar = grammar
         self.searches = SearchProcessor(grammar)
         self.lazy = lazy
         self.local_variables = local_variables
@@ -331,16 +334,17 @@ class ConstraintProcessor(FandangoParserVisitor):
     def get_constraints(
         self, constraints: list[FandangoParser.ConstraintContext]
     ) -> list[Constraint | SoftValue]:
-        return [self.visitConstraint(constraint) for constraint in constraints]
-        # if len(constraints) == 1:
-        #     return constraints[0]
-        # else:
-        #     return ConjunctionConstraint(
-        #         constraints,
-        #         local_variables=self.local_variables,
-        #         global_variables=self.global_variables,
-        #         lazy=self.lazy,
-        #    )
+        # A population-scoped `where` (Mechanism B) is a batch-construction directive, not a
+        # per-tree constraint: route it onto the grammar for the sampler and keep it out of
+        # the returned per-tree constraint list (where `population` is unbound and crashes).
+        results: list[Constraint | SoftValue] = []
+        for constraint in constraints:
+            parsed = self.visitConstraint(constraint)
+            if isinstance(parsed, PopulationRequirement):
+                self.grammar.population_requirements.append(parsed)
+            else:
+                results.append(parsed)
+        return results
 
     def visitConstraint(self, ctx: FandangoParser.ConstraintContext):
         LOGGER.debug(f"Visiting constraint: {ctx.getText()}")
@@ -354,6 +358,13 @@ class ConstraintProcessor(FandangoParserVisitor):
             )
         if ctx.implies():
             constraint = self.visitImplies(ctx.implies())
+            # A `where` that aggregates over the reserved `population` binder is a hard
+            # population requirement (Mechanism B), not a per-tree constraint. Detect it on
+            # the built ComparisonConstraint (the `where` path has no raw `.expression`, unlike
+            # `minimizing` below); get_constraints routes the result onto the grammar.
+            requirement = try_parse_population_requirement(constraint)
+            if requirement is not None:
+                return requirement
             return constraint
         elif ctx.MINIMIZING() or ctx.MAXIMIZING():
             expression_constraint = self.visitExpr(ctx.expr())

@@ -6,8 +6,13 @@ from collections.abc import Callable, Generator
 from typing import IO, Any, Optional, cast
 
 from fandango.constraints.constraint import Constraint
+from fandango.constraints.population_sampler import PopulationSampler
 from fandango.constraints.soft import SoftValue
-from fandango.errors import FandangoFailedError, FandangoParseError
+from fandango.errors import (
+    FandangoFailedError,
+    FandangoParseError,
+    FandangoValueError,
+)
 from fandango.evolution.algorithm import DefaultAlgorithm
 from fandango.language.grammar import FuzzingMode, ParsingMode
 from fandango.language.grammar.grammar import Grammar
@@ -405,6 +410,14 @@ class Fandango(FandangoBase):
         :param settings: Additional settings for the evolution algorithm
         :return: A list of derivation trees
         """
+        # A hard population `where` (Mechanism B) is a guarantee over the whole batch, not a
+        # per-tree fitness, so it is *constructed* by the population sampler above the GA rather
+        # than evolved. When the grammar carries any such requirement, route around the GA.
+        if self._grammar.population_requirements:
+            return self._fuzz_population(
+                desired_solutions, extra_constraints=extra_constraints
+            )
+
         max_generations, desired_solutions, infinite = (
             self._sanitize_runtime_end_settings(
                 mode,
@@ -438,6 +451,34 @@ class Fandango(FandangoBase):
         solutions.extend(padding)
 
         return solutions
+
+    def _fuzz_population(
+        self,
+        desired_solutions: Optional[int],
+        *,
+        extra_constraints: Optional[list[str]] = None,
+    ) -> list[DerivationTree]:
+        """Construct a batch satisfying the grammar's hard population requirements (Mechanism
+        B), bypassing the GA. v1 is honest about its limits: the batch size must be fixed, and
+        per-tree hard constraints alongside a population requirement are not yet co-enforced."""
+        if desired_solutions is None:
+            raise FandangoValueError(
+                "A population `where` requires a fixed batch size; "
+                "call fuzz(desired_solutions=N)."
+            )
+        per_tree_hard = [
+            c
+            for c in self._constraints
+            if isinstance(c, Constraint) and not isinstance(c, SoftValue)
+        ]
+        if per_tree_hard or extra_constraints:
+            raise NotImplementedError(
+                "v1 population sampling does not yet co-enforce per-tree hard constraints "
+                f"with a population requirement (found {len(per_tree_hard)} constraint(s)"
+                f"{' plus extra_constraints' if extra_constraints else ''}). This is future "
+                "work; for now use a spec with population requirements only."
+            )
+        return PopulationSampler(self._grammar).sample(desired_solutions)
 
     def parse(
         self,

@@ -18,11 +18,16 @@ This module is intentionally self-contained (reducers + parser + value type). It
 
 import ast
 import math
+import re
+from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from statistics import NormalDist, StatisticsError, correlation
 from typing import Any, Optional
 
+from fandango.constraints.comparison import ComparisonConstraint
+from fandango.constraints.constraint import Constraint
+from fandango.constraints.failing_tree import Comparison
 from fandango.constraints.fitness import ValueFitness
 from fandango.constraints.soft import SoftValue, Value
 from fandango.errors import FandangoValueError
@@ -173,11 +178,135 @@ REDUCER_TARGET_ARITY: dict[str, int] = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# Marginal companions
+# --------------------------------------------------------------------------- #
+# A marginal companion answers, cheaply and per value, "how does the aggregate move if this
+# value is removed?" -- i.e. it returns the removal influence ``Δ_v = agg_without_v - agg``
+# for each value, in the same order as ``values``. This is the O(N) analytic linearization of
+# leave-one-out: the ``marginal`` attribution mode evaluates the *same* outer expression as
+# ``loo`` but at ``agg + Δ`` instead of re-aggregating the whole population. Companions never
+# see the outer expression or the optimization goal -- that sign is applied generically in
+# PopulationValue. A reducer with no companion simply falls back to ``loo``.
+def _mean_marginal(values: list[Any]) -> list[float]:
+    n = len(values)
+    if n < 2:
+        return [0.0] * n
+    total = float(sum(values))
+    agg = total / n
+    return [(total - v) / (n - 1) - agg for v in values]
+
+
+def _stddev_marginal(values: list[Any]) -> list[float]:
+    n = len(values)
+    if n < 2:
+        return [0.0] * n
+    s = float(sum(values))
+    ss = float(sum(v * v for v in values))
+    agg = math.sqrt(max(0.0, ss / n - (s / n) ** 2))
+    out: list[float] = []
+    for v in values:
+        if n - 1 < 2:  # _stddev returns 0 for fewer than two values
+            agg_v = 0.0
+        else:
+            mean_v = (s - v) / (n - 1)
+            var_v = (ss - v * v) / (n - 1) - mean_v * mean_v
+            agg_v = math.sqrt(max(0.0, var_v))
+        out.append(agg_v - agg)
+    return out
+
+
+def _fraction_marginal(values: list[Any]) -> list[float]:
+    n = len(values)
+    if n < 2:
+        return [0.0] * n
+    truthy = sum(1 for v in values if v)
+    agg = truthy / n
+    return [(truthy - (1 if v else 0)) / (n - 1) - agg for v in values]
+
+
+def _count_marginal(values: list[Any]) -> list[float]:
+    # Removing any value drops the count by exactly one, so every value has the same
+    # influence: count objectives cannot discriminate individuals (expected, harmless).
+    return [-1.0] * len(values)
+
+
+def _distinct_count_marginal(values: list[Any]) -> list[float]:
+    counts = Counter(values)
+    # Distinct count drops by one only when the removed value was unique in the pool.
+    return [-1.0 if counts[v] == 1 else 0.0 for v in values]
+
+
+def wasserstein_marginal(
+    values: list[Any], quantile: Callable[[float], float]
+) -> list[float]:
+    """Removal influence of each value on :func:`wasserstein_fit` with target ``quantile``.
+
+    The fit is the mean gap ``(1/n) Σ |x_(k) - quantile((k+0.5)/n)|`` over the sorted
+    samples. Dropping the sample with gap ``d`` removes that term, so
+    ``Δ ≈ (agg - d) / (n - 1)``: a sample placed worse than average (``d > agg``) has a
+    negative influence (removing it lowers the distance -> it is penalised under
+    ``minimizing``); a well-placed sample has a positive one. This drops the second-order
+    requantisation term (the remaining samples renumber), which is exactly why it is a
+    sharper, lower-noise signal than yanking a whole tree via ``loo``. Depends only on the
+    quantile function, so every distributional fit -- built-in or downstream-registered --
+    gets its gradient from the same information it already supplies.
+    """
+    n = len(values)
+    if n < 2:
+        return [0.0] * n
+    order = sorted(range(n), key=lambda i: float(values[i]))
+    gaps = [0.0] * n
+    total = 0.0
+    for rank, i in enumerate(order):
+        d = abs(float(values[i]) - quantile((rank + 0.5) / n))
+        gaps[i] = d
+        total += d
+    agg = total / n
+    return [(agg - gaps[i]) / (n - 1) for i in range(n)]
+
+
+def _normal_marginal(values: list[Any], mu: "int | float", sigma: "int | float") -> list[float]:
+    return wasserstein_marginal(values, NormalDist(float(mu), float(sigma)).inv_cdf)
+
+
+def _lognormal_marginal(
+    values: list[Any], mu: "int | float", sigma: "int | float"
+) -> list[float]:
+    nd = NormalDist(float(mu), float(sigma))
+    return wasserstein_marginal(values, lambda p: math.exp(nd.inv_cdf(p)))
+
+
+def _uniform_fit_marginal(values: list[Any], lo: "int | float", hi: "int | float") -> list[float]:
+    return wasserstein_marginal(values, lambda p: lo + p * (hi - lo))
+
+
+def _exponential_marginal(values: list[Any], rate: "int | float") -> list[float]:
+    return wasserstein_marginal(values, lambda p: -math.log1p(-p) / rate)
+
+
+# name -> marginal companion. A reducer absent from this dict falls back to loo attribution.
+# `correlation` is deliberately omitted for now (its per-pair companion is a follow-up; see
+# PLAN-marginal-attribution.md §3, §11).
+REDUCER_MARGINALS: dict[str, Callable[..., list[float]]] = {
+    "mean": _mean_marginal,
+    "stddev": _stddev_marginal,
+    "fraction": _fraction_marginal,
+    "count": _count_marginal,
+    "distinct_count": _distinct_count_marginal,
+    "normal_fit": _normal_marginal,
+    "lognormal_fit": _lognormal_marginal,
+    "uniform_fit": _uniform_fit_marginal,
+    "exponential_fit": _exponential_marginal,
+}
+
+
 def register_reducer(
     name: str,
     reducer: Callable[..., float],
     *,
     target_arity: int = 0,
+    marginal: Optional[Callable[..., list[float]]] = None,
 ) -> None:
     """Register a population reducer so it can be used in an objective by ``name``.
 
@@ -202,6 +331,14 @@ def register_reducer(
         # then, in a .fan spec parsed *after* this call:
         #   minimizing gamma_fit([int(<age>) for x in population], 2.0, 10.0)
 
+    Pass ``marginal`` to enable the sharper, cheaper ``marginal`` attribution mode for this
+    reducer: a callable ``marginal(values, *target_params) -> list[float]`` returning the
+    removal influence ``agg_without_value - agg`` per value (see :func:`wasserstein_marginal`
+    and the built-ins). It is optional -- omit it and objectives using this reducer fall back
+    to ``loo`` attribution. For the common "I have a quantile function" case, prefer
+    :func:`register_distribution_fit`, which wires both the reducer and its marginal from a
+    single quantile.
+
     Registration mutates the process-wide registry, so it must run **before** the spec
     that references ``name`` is parsed. Re-registering an existing name overrides it,
     which lets a downstream provide a better-backed implementation of a built-in.
@@ -220,6 +357,48 @@ def register_reducer(
         REDUCER_TARGET_ARITY[name] = target_arity
     else:
         REDUCER_TARGET_ARITY.pop(name, None)
+    # Keep the marginal registry in lockstep: a re-registration without a marginal must clear
+    # any stale companion so the reducer cleanly falls back to loo instead of pairing a new
+    # reducer with an old, mismatched gradient.
+    if marginal is not None:
+        REDUCER_MARGINALS[name] = marginal
+    else:
+        REDUCER_MARGINALS.pop(name, None)
+
+
+def register_distribution_fit(
+    name: str,
+    quantile_factory: Callable[..., Callable[[float], float]],
+    *,
+    target_arity: int,
+) -> None:
+    """Register a distributional-fit reducer *and* its marginal from one quantile function.
+
+    ``quantile_factory(*target_params)`` returns the target distribution's quantile function
+    ``quantile(p)`` for ``p`` in ``(0, 1)``. Both the :func:`wasserstein_fit` reducer and the
+    matching :func:`wasserstein_marginal` gradient are built from it, so a downstream
+    distribution supplies *only* a quantile and gets a soft fit objective plus a sharp
+    ``marginal`` gradient for free::
+
+        from scipy.stats import gamma
+        from fandango.constraints.population import register_distribution_fit
+
+        register_distribution_fit(
+            "gamma_fit",
+            lambda a, scale: lambda p: gamma.ppf(p, a, scale=scale),
+            target_arity=2,
+        )
+        # then, in a .fan spec parsed *after* this call:
+        #   minimizing gamma_fit([int(<age>) for x in population], 2.0, 10.0)
+    """
+    register_reducer(
+        name,
+        lambda values, *params: wasserstein_fit(values, quantile_factory(*params)),
+        target_arity=target_arity,
+        marginal=lambda values, *params: wasserstein_marginal(
+            values, quantile_factory(*params)
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -245,6 +424,41 @@ class PopulationAggregate:
     # Literal target parameters following the generator, e.g. the (mu, sigma) of
     # normal_fit(<inner> for x in population, 30, 5).
     reducer_args: list[Any] = field(default_factory=list)
+
+
+# Reflection of a comparison operator under an operand swap: ``a OP b`` is equivalent to
+# ``b _REFLECTED_OPERATOR[OP] a``. Used to canonicalize a population-on-the-right comparison
+# (``50 <= distinct_count(...)``) into aggregate-on-the-left form. NOTE: this is *not*
+# ``Comparison.invert()``, which is logical negation (``==`` -> ``!=``).
+_REFLECTED_OPERATOR: dict[Comparison, Comparison] = {
+    Comparison.EQUAL: Comparison.EQUAL,
+    Comparison.NOT_EQUAL: Comparison.NOT_EQUAL,
+    Comparison.GREATER: Comparison.LESS,
+    Comparison.GREATER_EQUAL: Comparison.LESS_EQUAL,
+    Comparison.LESS: Comparison.GREATER,
+    Comparison.LESS_EQUAL: Comparison.GREATER_EQUAL,
+}
+
+
+@dataclass
+class PopulationRequirement:
+    """A hard, population-scoped ``where``: over the emitted batch of N individuals, the
+    aggregate must satisfy ``operator(aggregate, bound)``.
+
+    Built by :func:`try_parse_population_requirement` from a single top-level
+    ``ComparisonConstraint`` one side of which is a ``reducer(<inner> for x in population)``
+    aggregate. The operator is *canonicalized* so the aggregate is always the left operand:
+    a population-on-the-right comparison (``50 <= distinct_count(...)``) is reflected to the
+    equivalent aggregate-on-the-left form (``distinct_count(...) >= 50``).
+
+    ``bound`` is the user's literal target verbatim. Any batch-size-dependent snapping of an
+    exact target -- e.g. ``fraction(...) == 0.30`` rounding to ``round(0.30 * N) / N`` -- is
+    deferred to the sampler, where N is known; the detector only records the requirement.
+    """
+
+    aggregate: PopulationAggregate
+    operator: Comparison
+    bound: Any
 
 
 class _InnerValue(Value):
@@ -421,6 +635,99 @@ def try_parse_population_aggregate(
     )
 
 
+def _parse_requirement_bound(
+    source: str,
+    searches: dict[str, NonTerminalSearch],
+    reducer_name: str,
+) -> Any:
+    """The comparison target of a population requirement must be a compile-time numeric
+    literal: the batch is *constructed* toward a fixed number, so the bound cannot depend on
+    per-tree grammar values. A target that references a symbol (``searches`` non-empty) or is
+    otherwise non-literal / non-numeric is rejected with a clear message."""
+    example = f"{reducer_name}(<inner> for x in {POPULATION_BINDER}) == 0.30"
+    if searches:
+        raise FandangoValueError(
+            f"The target of a population requirement must be a constant, not a grammar "
+            f"symbol: got {source!r}. Write a fixed number, e.g. '{example}'."
+        )
+    try:
+        bound = ast.literal_eval(source)
+    except (ValueError, SyntaxError, TypeError):
+        raise FandangoValueError(
+            f"The target of a population requirement must be a literal number, e.g. "
+            f"'{example}'; got {source!r}."
+        )
+    if isinstance(bound, bool) or not isinstance(bound, (int, float)):
+        raise FandangoValueError(
+            f"The target of a population requirement must be a number, e.g. '{example}'; "
+            f"got {bound!r}."
+        )
+    return bound
+
+
+def try_parse_population_requirement(
+    constraint: Constraint,
+) -> Optional[PopulationRequirement]:
+    """Detect a hard population-scoped ``where`` in a freshly-built constraint.
+
+    Returns a :class:`PopulationRequirement` when ``constraint`` is a single
+    ``ComparisonConstraint`` with a ``reducer(<inner> for x in population)`` aggregate on one
+    side; returns ``None`` for an ordinary per-tree constraint (no ``population`` reference).
+    Raises :class:`FandangoValueError` when ``population`` *is* referenced but the shape is
+    unsupported in v1 -- a compound ``and``/``or``, a bare aggregate with no comparison, both
+    sides aggregating, or a non-literal target -- so misuse surfaces clearly instead of
+    silently degrading to a per-tree constraint (where ``population`` is unbound and crashes).
+
+    Detector only: the caller (``visitConstraint``'s ``where`` branch) routes the result to
+    the sampler layer rather than the per-tree evaluator. Reaching into the constraint's
+    ``_left``/``_right`` operands is deliberate -- they carry the post-substitution source and
+    split searches that :func:`try_parse_population_aggregate` already consumes.
+    """
+    if isinstance(constraint, ComparisonConstraint):
+        left = try_parse_population_aggregate(
+            constraint._left, constraint._left_searches
+        )
+        right = try_parse_population_aggregate(
+            constraint._right, constraint._right_searches
+        )
+        if left is None and right is None:
+            return None  # ordinary per-tree `where`
+        if left is not None and right is not None:
+            raise FandangoValueError(
+                f"'{POPULATION_BINDER}' may appear on only one side of a population "
+                f"requirement; got it on both in {constraint.format_as_spec()!r}."
+            )
+        if left is not None:
+            aggregate = left
+            operator = constraint._operator
+            bound_source, bound_searches = constraint._right, constraint._right_searches
+        else:
+            assert right is not None
+            aggregate = right
+            operator = _REFLECTED_OPERATOR[constraint._operator]
+            bound_source, bound_searches = constraint._left, constraint._left_searches
+        bound = _parse_requirement_bound(
+            bound_source, bound_searches, aggregate.reducer_name
+        )
+        return PopulationRequirement(
+            aggregate=aggregate, operator=operator, bound=bound
+        )
+
+    # Any non-comparison shape that mentions the reserved binder is an unsupported v1
+    # population `where` (compound `and`/`or`, a bare aggregate, ...). Reject it clearly
+    # rather than let it reach the per-tree Evaluator, where `population` is unbound. The
+    # binder can only appear as `for x in population` in the reconstructed source, so a
+    # word-boundary match on `format_as_spec()` is unambiguous (`population` is reserved).
+    if re.search(rf"\b{POPULATION_BINDER}\b", constraint.format_as_spec()):
+        raise FandangoValueError(
+            f"A population 'where' must be a single comparison, e.g. "
+            f"fraction(<inner> for x in {POPULATION_BINDER}) == 0.30; got "
+            f"{constraint.format_as_spec()!r}. Split a compound requirement into separate "
+            f"'where' lines, and give a bare aggregate a comparison and target."
+        )
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # PopulationValue
 # --------------------------------------------------------------------------- #
@@ -435,7 +742,7 @@ class PopulationValue(SoftValue):
     exactly as it normalizes a per-tree soft value.
     """
 
-    ATTRIBUTIONS = ("uniform", "loo")
+    ATTRIBUTIONS = ("uniform", "loo", "marginal")
 
     def __init__(
         self,
@@ -559,11 +866,18 @@ class PopulationValue(SoftValue):
         return best[1] if best else None
 
     # -- aggregate -> outer score ------------------------------------------ #
-    def _outer_score(self, values: Iterable[Any]) -> float:
-        values = list(values)
-        aggregate = REDUCERS[self.aggregate.reducer_name](
-            values, *self.aggregate.reducer_args
+    def _aggregate(self, values: Iterable[Any]) -> float:
+        """Run the reducer over ``values`` to the single aggregate scalar."""
+        return REDUCERS[self.aggregate.reducer_name](
+            list(values), *self.aggregate.reducer_args
         )
+
+    def _outer_from_aggregate(self, aggregate: float) -> float:
+        """Evaluate the outer expression with the aggregate substituted in.
+
+        Split out from :meth:`_outer_score` so ``marginal`` attribution can score a
+        linearly-perturbed aggregate (``agg + Δ``) without re-running the reducer.
+        """
         return float(
             eval(
                 self.aggregate.outer_expression,
@@ -572,12 +886,91 @@ class PopulationValue(SoftValue):
             )
         )
 
+    def _outer_score(self, values: Iterable[Any]) -> float:
+        return self._outer_from_aggregate(self._aggregate(values))
+
     def _goal_adjusted(self, outer_score: float, *, update: bool) -> float:
         """Normalize an outer score to [0, 1] where higher is always better."""
         if update:
             self.tdigest.update(outer_score)
         normalized = self.tdigest.score(outer_score)
         return normalized if self.optimization_goal == "max" else 1 - normalized
+
+    # -- attribution: aggregate score -> per-tree reward ------------------- #
+    def _reward_sign(self, outer_perturbed: float, outer_full: float) -> float:
+        """A positive reward means "this tree pulled the aggregate toward the goal".
+
+        For ``min`` the objective should go *up* when a helpful tree is removed; for
+        ``max`` it should go *down*. ``outer_perturbed`` is the outer score with the tree's
+        contribution removed (exactly, for ``loo``; linearly approximated, for ``marginal``).
+        """
+        if self.optimization_goal == "min":
+            return outer_perturbed - outer_full
+        return outer_full - outer_perturbed
+
+    def _loo_rewards(
+        self, per_tree: list[list[Any]], outer_full: float
+    ) -> list[float]:
+        """Leave-one-out: re-score the objective over the population minus each tree."""
+        rewards: list[float] = []
+        for i in range(len(per_tree)):
+            rest = [v for j, values in enumerate(per_tree) if j != i for v in values]
+            if not rest:
+                rewards.append(0.0)
+                continue
+            try:
+                outer_loo = self._outer_score(rest)
+            except Exception:
+                outer_loo = outer_full
+            rewards.append(self._reward_sign(outer_loo, outer_full))
+        return rewards
+
+    def _marginal_rewards(
+        self,
+        per_tree: list[list[Any]],
+        all_values: list[Any],
+        agg_full: float,
+        outer_full: float,
+    ) -> list[float]:
+        """The O(N) linearization of :meth:`_loo_rewards`.
+
+        Ask the reducer's marginal companion for each value's removal influence
+        ``Δ_v = agg_without_v - agg``, sum those over each tree, and score the outer
+        expression once per tree at ``agg + Σ Δ_v`` — the first-order approximation of the
+        leave-one-tree-out aggregate, with no re-aggregation. Falls back to ``loo`` when the
+        reducer has no companion (e.g. ``correlation``) or the population is too small.
+        """
+        marginal = REDUCER_MARGINALS.get(self.aggregate.reducer_name)
+        if marginal is None or len(all_values) < 2:
+            LOGGER.info(
+                f"No marginal companion for reducer {self.aggregate.reducer_name!r} "
+                f"(or population too small); falling back to loo attribution."
+            )
+            return self._loo_rewards(per_tree, outer_full)
+        try:
+            deltas = marginal(all_values, *self.aggregate.reducer_args)
+        except Exception as e:
+            LOGGER.error(
+                f"Marginal companion for {self.aggregate.reducer_name!r} failed ({e}); "
+                f"falling back to loo attribution."
+            )
+            return self._loo_rewards(per_tree, outer_full)
+
+        rewards: list[float] = []
+        cursor = 0
+        for values in per_tree:
+            k = len(values)
+            if k == 0:
+                rewards.append(0.0)
+                continue
+            delta_tree = sum(deltas[cursor : cursor + k])
+            cursor += k
+            try:
+                outer_tree = self._outer_from_aggregate(agg_full + delta_tree)
+            except Exception:
+                outer_tree = outer_full
+            rewards.append(self._reward_sign(outer_tree, outer_full))
+        return rewards
 
     # -- public entry point ------------------------------------------------ #
     def evaluate_population(self, population: list[DerivationTree]) -> list[float]:
@@ -593,7 +986,8 @@ class PopulationValue(SoftValue):
             return [0.0] * n
 
         try:
-            outer_full = self._outer_score(all_values)
+            agg_full = self._aggregate(all_values)
+            outer_full = self._outer_from_aggregate(agg_full)
         except Exception as e:  # keep the GA alive on a bad user expression
             LOGGER.error(
                 f"Error evaluating population objective {self.format_as_spec()}: {e}"
@@ -605,33 +999,21 @@ class PopulationValue(SoftValue):
         if self.attribution == "uniform":
             return [base] * n
 
-        # Leave-one-out: reward each individual by how much *including* it moves the
-        # objective toward its goal. The bonus is additive — `0.5*base + 0.5*reward` —
-        # not multiplicative, so a cold `tdigest` (base ~= 0 for the first few
-        # generations) does not wipe out the per-individual selection gradient exactly
-        # when the GA needs it to start moving. Rewards are min-max normalized across
-        # the population into [0, 1] (0.5 for everyone when there is no spread).
+        # Reward each individual by how much *including* it moves the objective toward its
+        # goal. `loo` measures this exactly by re-aggregation; `marginal` approximates it
+        # analytically in O(N). The bonus is additive — `0.5*base + 0.5*reward` — not
+        # multiplicative, so a cold `tdigest` (base ~= 0 for the first few generations) does
+        # not wipe out the per-individual selection gradient exactly when the GA needs it to
+        # start moving. Rewards are min-max normalized across the population into [0, 1]
+        # (0.5 for everyone when there is no spread).
         #
-        # NOTE: min-max normalization amplifies arbitrarily small reward differences to
-        # the full range; smarter scaling is a tuning lever to revisit when benchmarking
-        # attribution modes (see PLAN §2, §6).
-        rewards: list[float] = []
-        for i in range(n):
-            rest = [v for j, values in enumerate(per_tree) if j != i for v in values]
-            if not rest:
-                rewards.append(0.0)
-                continue
-            try:
-                outer_loo = self._outer_score(rest)
-            except Exception:
-                outer_loo = outer_full
-            # For "min" the objective should go *up* when a helpful individual is
-            # removed; for "max" it should go *down*. Either way a positive reward means
-            # "this individual pulled the aggregate toward the goal".
-            if self.optimization_goal == "min":
-                rewards.append(outer_loo - outer_full)
-            else:
-                rewards.append(outer_full - outer_loo)
+        # NOTE: min-max normalization amplifies arbitrarily small reward differences to the
+        # full range; smarter scaling is a tuning lever kept separate so `loo` vs `marginal`
+        # A/Bs change exactly one variable (see PLAN-marginal-attribution.md §5, §11).
+        if self.attribution == "marginal":
+            rewards = self._marginal_rewards(per_tree, all_values, agg_full, outer_full)
+        else:
+            rewards = self._loo_rewards(per_tree, outer_full)
 
         lo, hi = min(rewards), max(rewards)
         if hi - lo < 1e-12:

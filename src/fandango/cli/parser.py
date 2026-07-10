@@ -217,10 +217,12 @@ def _get_algorithm_parser() -> argparse.ArgumentParser:
     )
     algorithm_group.add_argument(
         "--population-attribution",
-        choices=["loo", "uniform"],
+        choices=["loo", "uniform", "marginal"],
         help="How a population-level soft objective's aggregate score is attributed back "
         "to individuals: 'loo' (leave-one-out, rewards individuals that pull the "
-        "aggregate toward the goal) or 'uniform' (same score for all).",
+        "aggregate toward the goal), 'marginal' (a cheaper, sharper O(N) analytic "
+        "approximation of 'loo'; falls back to 'loo' for reducers without a companion, "
+        "e.g. correlation), or 'uniform' (same score for all).",
         default=None,
     )
     algorithm_group.add_argument(

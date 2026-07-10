@@ -9,23 +9,32 @@ import unittest
 from pathlib import Path
 
 from fandango.constraints.population import (
+    REDUCER_MARGINALS,
     REDUCER_TARGET_ARITY,
     REDUCERS,
+    PopulationRequirement,
     PopulationValue,
     _correlation,
     _count,
+    _count_marginal,
     _distinct_count,
+    _distinct_count_marginal,
     _exponential_fit,
     _fraction,
     _lognormal_fit,
     _mean,
+    _mean_marginal,
     _normal_fit,
     _stddev,
+    _stddev_marginal,
     _uniform_fit,
+    register_distribution_fit,
     register_reducer,
     try_parse_population_aggregate,
     wasserstein_fit,
+    wasserstein_marginal,
 )
+from fandango.constraints.failing_tree import Comparison
 from fandango.errors import FandangoValueError
 from fandango.evolution.algorithm import DefaultAlgorithm, LoggerLevel
 from fandango.language.parse.parse import parse
@@ -52,6 +61,29 @@ def _parse_spec(objective: str):
         Path(path).unlink(missing_ok=True)
     assert constraints
     return grammar, constraints[0]
+
+
+def _parse_lines(*lines: str):
+    """Parse GRAMMAR + the given constraint lines, returning (grammar, constraints).
+    Unlike ``_parse_spec`` this makes no assumption about the constraint count -- a pure
+    population `where` (Mechanism B) is routed onto ``grammar.population_requirements`` and
+    leaves the returned constraint list empty."""
+    spec = GRAMMAR + "\n" + "\n".join(lines) + "\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".fan", delete=False) as f:
+        f.write(spec)
+        path = f.name
+    try:
+        with open(path) as f:
+            return parse(f, use_stdlib=False, use_cache=False)
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
+def _sole_requirement(objective: str):
+    """Parse a single population `where` line and return its lone PopulationRequirement."""
+    grammar, _ = _parse_lines(objective)
+    assert len(grammar.population_requirements) == 1
+    return grammar.population_requirements[0]
 
 
 def _parse_objective(objective: str):
@@ -155,6 +187,60 @@ class TestReducers(unittest.TestCase):
         )
 
 
+class TestReducerMarginals(unittest.TestCase):
+    """The marginal companions return ``Δ_v = agg_without_v - agg`` per value — the O(N)
+    analytic removal influence that powers ``marginal`` attribution."""
+
+    def test_mean_marginal_is_exact(self):
+        vals = [10, 20, 30, 40, 90]
+        agg = _mean(vals)
+        exact = [
+            _mean([w for j, w in enumerate(vals) if j != i]) - agg
+            for i in range(len(vals))
+        ]
+        for got, want in zip(_mean_marginal(vals), exact):
+            self.assertAlmostEqual(got, want, places=9)
+
+    def test_stddev_marginal_is_exact(self):
+        vals = [10, 20, 30, 40, 90]
+        agg = _stddev(vals)
+        exact = [
+            _stddev([w for j, w in enumerate(vals) if j != i]) - agg
+            for i in range(len(vals))
+        ]
+        for got, want in zip(_stddev_marginal(vals), exact):
+            self.assertAlmostEqual(got, want, places=9)
+
+    def test_small_populations_are_neutral(self):
+        # Δ needs at least two values (removal leaves n-1 >= 1); below that -> flat 0.
+        nd = statistics.NormalDist(0, 1)
+        self.assertEqual(_mean_marginal([5]), [0.0])
+        self.assertEqual(_stddev_marginal([5]), [0.0])
+        self.assertEqual(wasserstein_marginal([5], nd.inv_cdf), [0.0])
+
+    def test_count_marginal_is_uniform(self):
+        # Removing any value drops the count by one -> no discrimination (expected).
+        self.assertEqual(_count_marginal([1, 2, 3]), [-1.0, -1.0, -1.0])
+
+    def test_distinct_count_marginal_flags_uniques(self):
+        # 7 and 9 are unique (removal drops distinct by one); the two 5s are not.
+        self.assertEqual(_distinct_count_marginal([5, 5, 7, 9]), [0.0, 0.0, -1.0, -1.0])
+
+    def test_wasserstein_marginal_penalises_the_misplaced(self):
+        # A right-tail outlier is worse-placed than the bulk, so removing it lowers the
+        # distance most: it must carry the most negative (lowest) influence.
+        nd = statistics.NormalDist(30, 5)
+        sample = [nd.inv_cdf((i + 0.5) / 40) for i in range(40)] + [95.0]
+        influence = wasserstein_marginal(sample, nd.inv_cdf)
+        self.assertEqual(min(influence), influence[-1])
+        self.assertLess(influence[-1], 0.0)
+
+    def test_registry_covers_every_reducer_but_correlation(self):
+        # correlation's per-pair companion is future work; it falls back to loo. Every
+        # other reducer ships a marginal.
+        self.assertEqual(set(REDUCERS) - set(REDUCER_MARGINALS), {"correlation"})
+
+
 class TestParsePopulationAggregate(unittest.TestCase):
     def test_accepts_mean(self):
         c = _parse_objective("minimizing abs(mean(int(<age>) for x in population) - 30)")
@@ -255,6 +341,89 @@ class TestParsePopulationAggregate(unittest.TestCase):
             try_parse_population_aggregate("population + 1", {})
 
 
+class TestParsePopulationRequirement(unittest.TestCase):
+    """Mechanism B step 2/3: a population-scoped `where` parses into a PopulationRequirement
+    (routed onto ``grammar.population_requirements``). The detector post-processes the
+    ``ComparisonConstraint`` that ``visitImplies`` builds -- there is no ``.expression`` AST on
+    the `where` path, unlike `minimizing`. No sampler is exercised here; N-dependent snapping
+    and gating of the bound happen later."""
+
+    def test_accepts_exact_fraction(self):
+        req = _sole_requirement(
+            "where fraction(int(<age>) == 1 for x in population) == 0.30"
+        )
+        self.assertIsInstance(req, PopulationRequirement)
+        self.assertEqual(req.aggregate.reducer_name, "fraction")
+        self.assertEqual(req.operator, Comparison.EQUAL)
+        self.assertEqual(req.bound, 0.30)
+        # the aggregate's inner element is preserved intact (the `== 1` stays in the genexp).
+        self.assertIn("== 1", req.aggregate.inner_expression)
+
+    def test_accepts_inequality(self):
+        req = _sole_requirement("where distinct_count(<age> for x in population) >= 50")
+        self.assertEqual(req.aggregate.reducer_name, "distinct_count")
+        self.assertEqual(req.operator, Comparison.GREATER_EQUAL)
+        self.assertEqual(req.bound, 50)
+
+    def test_population_on_right_is_reflected(self):
+        # `50 <= distinct_count(...)` is the same requirement as `distinct_count(...) >= 50`;
+        # the detector canonicalizes to aggregate-on-the-left by reflecting the operator.
+        req = _sole_requirement("where 50 <= distinct_count(<age> for x in population)")
+        self.assertEqual(req.aggregate.reducer_name, "distinct_count")
+        self.assertEqual(req.operator, Comparison.GREATER_EQUAL)
+        self.assertEqual(req.bound, 50)
+
+    def test_population_on_right_equal_is_symmetric(self):
+        req = _sole_requirement(
+            "where 0.30 == fraction(int(<age>) == 1 for x in population)"
+        )
+        self.assertEqual(req.operator, Comparison.EQUAL)
+        self.assertEqual(req.bound, 0.30)
+
+    def test_statistical_reducer_keeps_target_params(self):
+        req = _sole_requirement(
+            "where normal_fit([int(<age>) for x in population], 30, 5) <= 0.3"
+        )
+        self.assertEqual(req.aggregate.reducer_name, "normal_fit")
+        self.assertEqual(req.aggregate.reducer_args, [30, 5])
+        self.assertEqual(req.operator, Comparison.LESS_EQUAL)
+        self.assertEqual(req.bound, 0.3)
+
+    def test_per_tree_where_produces_no_requirement(self):
+        # An ordinary per-tree `where` never mentions `population` and is left untouched.
+        grammar, constraints = _parse_lines("where int(<age>) >= 18")
+        self.assertEqual(grammar.population_requirements, [])
+        self.assertEqual(len(constraints), 1)
+
+    def test_conjunction_is_rejected(self):
+        # R2: v1 supports only a single top-level comparison. A compound `and` referencing
+        # `population` must raise, not silently fall through to the per-tree evaluator.
+        with self.assertRaises(FandangoValueError):
+            _parse_lines(
+                "where fraction(int(<age>) == 1 for x in population) == 0.30 "
+                "and distinct_count(<age> for x in population) >= 50"
+            )
+
+    def test_bare_aggregate_without_comparison_is_rejected(self):
+        with self.assertRaises(FandangoValueError):
+            _parse_lines("where fraction(int(<age>) == 1 for x in population)")
+
+    def test_both_sides_aggregating_is_rejected(self):
+        with self.assertRaises(FandangoValueError):
+            _parse_lines(
+                "where fraction(int(<age>) == 1 for x in population) "
+                "== fraction(int(<age>) == 2 for x in population)"
+            )
+
+    def test_non_literal_target_is_rejected(self):
+        # The target must be a compile-time constant; a grammar symbol on the bound side
+        # cannot be constructed toward.
+        with self.assertRaises(FandangoValueError):
+            _parse_lines(
+                "where fraction(int(<age>) == 1 for x in population) == int(<age>)"
+            )
+
+
 class TestConvertTimeRejection(unittest.TestCase):
     """Malformed population objectives surface at parse/convert time."""
 
@@ -265,6 +434,52 @@ class TestConvertTimeRejection(unittest.TestCase):
     def test_population_outside_reducer(self):
         with self.assertRaises(FandangoValueError):
             _parse_objective("minimizing population + 1")
+
+
+class TestPopulationRequirementRouting(unittest.TestCase):
+    """Mechanism B step 3: convert-time routing. A population `where` lands on
+    `grammar.population_requirements` and is kept OUT of the per-tree constraint list (where
+    `population` is unbound and evaluation would crash)."""
+
+    def test_population_where_routes_to_grammar_not_constraints(self):
+        grammar, constraints = _parse_lines(
+            "where fraction(int(<age>) == 1 for x in population) == 0.30"
+        )
+        # It never enters the per-tree constraint list...
+        self.assertEqual(constraints, [])
+        # ...and is recorded as a construction directive on the grammar.
+        self.assertEqual(len(grammar.population_requirements), 1)
+        req = grammar.population_requirements[0]
+        self.assertIsInstance(req, PopulationRequirement)
+        self.assertEqual(req.aggregate.reducer_name, "fraction")
+        self.assertEqual(req.operator, Comparison.EQUAL)
+        self.assertEqual(req.bound, 0.30)
+
+    def test_per_tree_where_stays_a_constraint(self):
+        grammar, constraints = _parse_lines("where int(<age>) >= 18")
+        self.assertEqual(len(constraints), 1)
+        self.assertEqual(grammar.population_requirements, [])
+
+    def test_mixed_lines_are_split(self):
+        # A per-tree `where` and a population `where` in the same spec are routed apart.
+        grammar, constraints = _parse_lines(
+            "where int(<age>) >= 18",
+            "where distinct_count(<age> for x in population) >= 50",
+        )
+        self.assertEqual(len(constraints), 1)
+        self.assertEqual(len(grammar.population_requirements), 1)
+        self.assertEqual(
+            grammar.population_requirements[0].aggregate.reducer_name, "distinct_count"
+        )
+
+    def test_per_tree_conjunction_is_untouched(self):
+        # The detector now runs on every `where`; a per-tree boolean must pass through, not
+        # trip the R2 "single comparison" rejection (which is keyed on the population binder).
+        grammar, constraints = _parse_lines(
+            "where int(<age>) >= 18 and int(<age>) <= 65"
+        )
+        self.assertEqual(len(constraints), 1)
+        self.assertEqual(grammar.population_requirements, [])
 
 
 class TestRegisterReducer(unittest.TestCase):
@@ -456,6 +671,87 @@ class TestPopulationValueAttribution(unittest.TestCase):
         bonuses = pv.evaluate_population(_real_population(grammar, 4))
         self.assertEqual(bonuses[0], max(bonuses))
 
+    def test_marginal_rewards_the_helper(self):
+        # Same setup as the loo test: individual 0 sits on target; marginal must also rank
+        # it top and tie the three equally-unhelpful individuals.
+        pv, grammar = _population_value(self.OBJECTIVE, "marginal")
+        pv._inner_values_per_tree = lambda pop: [[30], [100], [100], [100]]
+        bonuses = pv.evaluate_population(_real_population(grammar, 4))
+        self.assertEqual(bonuses[0], max(bonuses))
+        self.assertGreater(bonuses[0], bonuses[1])
+        self.assertEqual(bonuses[1], bonuses[2])
+        self.assertEqual(bonuses[2], bonuses[3])
+
+    def test_marginal_equals_loo_for_single_value_mean(self):
+        # mean's marginal is the *exact* linearisation of loo, and for single-value trees
+        # `mean + Δ_i` reproduces the leave-one-out mean exactly, so the two attribution
+        # modes must yield identical bonus vectors.
+        stub = [[30], [10], [55], [90], [42]]
+        pv_loo, grammar = _population_value(self.OBJECTIVE, "loo")
+        pv_loo._inner_values_per_tree = lambda pop: stub
+        pv_marg, _ = _population_value(self.OBJECTIVE, "marginal")
+        pv_marg._inner_values_per_tree = lambda pop: stub
+        pop = _real_population(grammar, len(stub))
+        for a, b in zip(
+            pv_loo.evaluate_population(pop), pv_marg.evaluate_population(pop)
+        ):
+            self.assertAlmostEqual(a, b, places=9)
+
+    def test_marginal_falls_back_to_loo_without_companion(self):
+        # A reducer with no marginal companion must reproduce loo exactly under `marginal`.
+        register_reducer(
+            "median_nomarg", lambda vs: statistics.median(vs) if vs else 0.0
+        )
+        try:
+            obj = "minimizing abs(median_nomarg(int(<age>) for x in population) - 30)"
+            stub = [[30], [10], [55], [90]]
+            pv_loo, grammar = _population_value(obj, "loo")
+            pv_loo._inner_values_per_tree = lambda pop: stub
+            pv_marg, _ = _population_value(obj, "marginal")
+            pv_marg._inner_values_per_tree = lambda pop: stub
+            pop = _real_population(grammar, len(stub))
+            self.assertEqual(
+                pv_loo.evaluate_population(pop), pv_marg.evaluate_population(pop)
+            )
+        finally:
+            REDUCERS.pop("median_nomarg", None)
+            REDUCER_MARGINALS.pop("median_nomarg", None)
+
+    def test_register_distribution_fit_wires_reducer_and_marginal(self):
+        # A downstream distribution supplies *only* a quantile and gets both a fit reducer
+        # and a discriminating marginal for free.
+        register_distribution_fit(
+            "half_normal_fit",
+            lambda sigma: (
+                lambda p: abs(statistics.NormalDist(0, sigma).inv_cdf((p + 1) / 2))
+            ),
+            target_arity=1,
+        )
+        try:
+            self.assertIn("half_normal_fit", REDUCERS)
+            self.assertIn("half_normal_fit", REDUCER_MARGINALS)
+            vals = [1.0, 3.0, 8.0, 2.0, 5.0]
+            self.assertIsInstance(REDUCERS["half_normal_fit"](vals, 2.0), float)
+            marg = REDUCER_MARGINALS["half_normal_fit"](vals, 2.0)
+            self.assertEqual(len(marg), len(vals))
+            self.assertGreater(max(marg) - min(marg), 0.0)  # actually discriminates
+        finally:
+            REDUCERS.pop("half_normal_fit", None)
+            REDUCER_MARGINALS.pop("half_normal_fit", None)
+            REDUCER_TARGET_ARITY.pop("half_normal_fit", None)
+
+    def test_reregister_without_marginal_clears_stale_companion(self):
+        register_reducer(
+            "tmp_reducer", lambda vs: 0.0, marginal=lambda vs: [0.0] * len(vs)
+        )
+        self.assertIn("tmp_reducer", REDUCER_MARGINALS)
+        register_reducer("tmp_reducer", lambda vs: 1.0)  # no marginal this time
+        try:
+            self.assertNotIn("tmp_reducer", REDUCER_MARGINALS)
+        finally:
+            REDUCERS.pop("tmp_reducer", None)
+            REDUCER_MARGINALS.pop("tmp_reducer", None)
+
 
 class TestPopulationEndToEnd(unittest.TestCase):
     """End-to-end: the objective must steer the population distribution relative to the
@@ -466,7 +762,7 @@ class TestPopulationEndToEnd(unittest.TestCase):
     POPULATION_SIZE = 40
     SEED = 1
 
-    def _final_population(self, spec_file, *, with_objective):
+    def _final_population(self, spec_file, *, with_objective, attribution="loo"):
         with open(spec_file) as f:
             grammar, constraints = parse(f, use_stdlib=False, use_cache=False)
         fandango = DefaultAlgorithm(
@@ -475,6 +771,7 @@ class TestPopulationEndToEnd(unittest.TestCase):
             random_seed=self.SEED,
             logger_level=LoggerLevel.ERROR,
             population_size=self.POPULATION_SIZE,
+            population_attribution=attribution,
         )
         # Drain the generator so the GA runs the full generation budget; we inspect the
         # final working set rather than the (immediately-satisfied) solution stream.
@@ -506,6 +803,29 @@ class TestPopulationEndToEnd(unittest.TestCase):
             abs(opt_mean - target),
             abs(base_mean - target) - 2.0,
             f"objective mean {opt_mean:.1f} not meaningfully closer to {target} "
+            f"than baseline {base_mean:.1f}",
+        )
+
+    def test_mean_converges_toward_target_with_marginal(self):
+        target = 30
+        base = self._numbers(
+            self._final_population(
+                RESOURCES_ROOT / "population_mean.fan", with_objective=False
+            )
+        )
+        opt = self._numbers(
+            self._final_population(
+                RESOURCES_ROOT / "population_mean.fan",
+                with_objective=True,
+                attribution="marginal",
+            )
+        )
+        base_mean, opt_mean = statistics.mean(base), statistics.mean(opt)
+        # marginal must steer at least as clearly as loo does on this location objective.
+        self.assertLess(
+            abs(opt_mean - target),
+            abs(base_mean - target) - 2.0,
+            f"marginal mean {opt_mean:.1f} not meaningfully closer to {target} "
             f"than baseline {base_mean:.1f}",
         )
 

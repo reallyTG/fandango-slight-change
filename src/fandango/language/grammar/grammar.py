@@ -47,6 +47,11 @@ class Grammar(NodeVisitor[list[Node], list[Node]]):
         self._grammar_settings = grammar_settings
         self.rules: dict[NonTerminal, Node] = rules or {}
         self.generators: dict[NonTerminal, LiteralGenerator] = {}
+        # Hard population-scoped `where` clauses (Mechanism B), attached at convert time and
+        # consumed by the population sampler above the GA -- a batch-construction directive,
+        # like the `:=` generators above. Typed loosely (`list[Any]`) to avoid a
+        # grammar -> constraints.population -> constraints.comparison -> grammar import cycle.
+        self.population_requirements: list[Any] = []
         self.fuzzing_mode = fuzzing_mode
         self._local_variables = local_variables or {}
         self._global_variables = global_variables or {}
@@ -284,6 +289,13 @@ class Grammar(NodeVisitor[list[Node], list[Node]]):
         self.rules.update(rules)
         self.fuzzing_mode = fuzzing_mode
         self.generators.update(generators)
+
+        # Carry hard population requirements (Mechanism B) across a grammar merge, exactly as
+        # generators are carried -- otherwise merging a user grammar into the stdlib grammar
+        # (parse() builds the stdlib first) silently drops them. Guard `grammar is not self`:
+        # parse() also calls `grammar.update(grammar)` to prime, which would else duplicate.
+        if isinstance(grammar, Grammar) and grammar is not self:
+            self.population_requirements.extend(grammar.population_requirements)
 
         for symbol in rules.keys():
             # We're updating from a grammar with a rule, but no generator,

@@ -164,8 +164,9 @@ def main():
     ap.add_argument("--generations", type=int, default=400)
     ap.add_argument("--population-size", type=int, default=40)
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--attribution", choices=["loo", "uniform"], default="loo",
-                    help="loo (default) gives a real gradient; uniform barely steers")
+    ap.add_argument("--attribution", choices=["loo", "uniform", "marginal"], default="loo",
+                    help="loo (default) and marginal give a real gradient; uniform barely "
+                         "steers. marginal is a cheaper, sharper O(N) approximation of loo.")
     args = ap.parse_args()
 
     print("These are SOFT objectives: they bias the distribution over generations, they")
