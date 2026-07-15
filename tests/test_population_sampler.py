@@ -434,6 +434,112 @@ class TestPopulationSamplerJoint(unittest.TestCase):
             PopulationSampler(grammar, constraints=constraints).sample(20)
 
 
+CORR_GRAMMAR = (
+    '<start> ::= <age> "," <income> "\\n"\n'
+    "<age> ::= r'[0-9][0-9]'\n"
+    "<income> ::= r'[0-9][0-9][0-9]'\n"
+)
+
+
+def _corr_grammar(*where_lines, grammar_src=CORR_GRAMMAR):
+    spec = grammar_src + "\n" + "\n".join(where_lines) + "\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".fan", delete=False) as f:
+        f.write(spec)
+        path = f.name
+    try:
+        with open(path) as f:
+            return parse(f, use_stdlib=False, use_cache=False)
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
+def _age_income_pairs(batch):
+    rows = [str(t).strip().split(",") for t in batch]
+    return [(int(r[0]), int(r[1])) for r in rows]
+
+
+class TestPopulationSamplerCorrelation(unittest.TestCase):
+    """Coupled `correlation((<x>, <y>)) OP r`: pair two fields so their per-individual correlation
+    meets the bound, then graft both together."""
+
+    def setUp(self):
+        random.seed(0)
+
+    def test_positive_correlation_achieved(self):
+        grammar, constraints = _corr_grammar(
+            "where correlation((int(<age>), int(<income>)) for x in population) >= 0.5"
+        )
+        batch = PopulationSampler(grammar, constraints=constraints).sample(30)
+        self.assertEqual(len(batch), 30)
+        self.assertGreaterEqual(REDUCERS["correlation"](_age_income_pairs(batch)), 0.5)
+
+    def test_negative_correlation_achieved(self):
+        grammar, constraints = _corr_grammar(
+            "where correlation((int(<age>), int(<income>)) for x in population) <= -0.5"
+        )
+        batch = PopulationSampler(grammar, constraints=constraints).sample(30)
+        self.assertLessEqual(REDUCERS["correlation"](_age_income_pairs(batch)), -0.5)
+
+    def test_reversed_tuple_order(self):
+        # (income, age) -- position order must drive which field is grafted, not sorted order.
+        grammar, constraints = _corr_grammar(
+            "where correlation((int(<income>), int(<age>)) for x in population) >= 0.5"
+        )
+        batch = PopulationSampler(grammar, constraints=constraints).sample(30)
+        self.assertGreaterEqual(REDUCERS["correlation"](_age_income_pairs(batch)), 0.5)
+
+    def test_coupled_plus_disjoint_single_field(self):
+        src = (
+            '<start> ::= <age> "," <income> "," <occ> "\\n"\n'
+            "<age> ::= r'[0-9][0-9]'\n"
+            "<income> ::= r'[0-9][0-9][0-9]'\n"
+            '<occ> ::= "eng" | "doc" | "art" | "law" | "edu"\n'
+        )
+        grammar, constraints = _corr_grammar(
+            "where correlation((int(<age>), int(<income>)) for x in population) >= 0.5",
+            "where distinct_count(<occ> for x in population) >= 3",
+            grammar_src=src,
+        )
+        batch = PopulationSampler(grammar, constraints=constraints).sample(30)
+        rows = [str(t).strip().split(",") for t in batch]
+        pairs = [(int(r[0]), int(r[1])) for r in rows]
+        self.assertGreaterEqual(REDUCERS["correlation"](pairs), 0.5)
+        self.assertGreaterEqual(REDUCERS["distinct_count"]([r[2] for r in rows]), 3)
+
+    def test_exact_correlation_rejected(self):
+        grammar, constraints = _corr_grammar(
+            "where correlation((int(<age>), int(<income>)) for x in population) == 0.5"
+        )
+        with self.assertRaises(NotImplementedError):
+            PopulationSampler(grammar, constraints=constraints).sample(30)
+
+    def test_wrong_symbol_count_rejected(self):
+        grammar, constraints = _corr_grammar(
+            "where correlation(int(<age>) for x in population) >= 0.5"
+        )
+        with self.assertRaises(NotImplementedError):
+            PopulationSampler(grammar, constraints=constraints).sample(30)
+
+    def test_overlapping_field_rejected(self):
+        grammar, constraints = _corr_grammar(
+            "where correlation((int(<age>), int(<income>)) for x in population) >= 0.5",
+            "where fraction(int(<age>) >= 50 for x in population) == 0.30",
+        )
+        with self.assertRaises(FandangoValueError):
+            PopulationSampler(grammar, constraints=constraints).sample(30)
+
+    def test_shortfall_when_unreachable(self):
+        # A constant income column has zero variance -> correlation is 0.0, never >= 0.5.
+        grammar, constraints = _corr_grammar(
+            "where correlation((int(<age>), int(<income>)) for x in population) >= 0.5",
+            grammar_src='<start> ::= <age> "," <income> "\\n"\n'
+            "<age> ::= r'[0-9][0-9]'\n"
+            '<income> ::= "5"\n',
+        )
+        with self.assertRaises(PopulationShortfallError):
+            PopulationSampler(grammar, constraints=constraints).sample(30)
+
+
 class TestPopulationSamplerEndToEnd(unittest.TestCase):
     """Through the public `Fandango.fuzz` API: a population `where` routes to the sampler."""
 
@@ -500,6 +606,21 @@ class TestPopulationSamplerEndToEnd(unittest.TestCase):
         self.assertEqual(REDUCERS["fraction"]([int(r[0]) == 1 for r in rows]), 0.30)
         self.assertGreaterEqual(REDUCERS["distinct_count"]([r[1] for r in rows]), 3)
         self.assertLessEqual(REDUCERS["normal_fit"]([int(r[2]) for r in rows], 30, 5), 0.6)
+
+    CORR_SPEC = (
+        '<start> ::= <age> "," <income> "\\n"\n'
+        "<age> ::= r'[0-9][0-9]'\n"
+        "<income> ::= r'[0-9][0-9][0-9]'\n"
+        "where correlation((int(<age>), int(<income>)) for x in population) >= 0.5\n"
+    )
+
+    def test_fuzz_constructs_correlated_batch(self):
+        fan = Fandango(self.CORR_SPEC)
+        batch = fan.fuzz(desired_solutions=30)
+        self.assertEqual(len(batch), 30)
+        rows = [str(t).strip().split(",") for t in batch]
+        pairs = [(int(r[0]), int(r[1])) for r in rows]
+        self.assertGreaterEqual(REDUCERS["correlation"](pairs), 0.5)
 
     def test_per_tree_constraint_is_co_enforced_via_fuzz(self):
         # income quota at the batch level + a per-tree lower bound on an independent age field.

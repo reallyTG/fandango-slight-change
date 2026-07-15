@@ -27,10 +27,16 @@ whose fields nest, are rejected.
 A final verification gate re-checks the assembled batch in every case, and per-tree hard constraints
 from the spec are co-enforced -- every constructed individual is drawn to satisfy them (the
 candidate source rejection-fuzzes; grafted individuals are re-checked). Everything else raises a
-clear error rather than silently degrading: multi-symbol (row-scoped/coupled) requirements and
-multi-valued inner fields (the grouping-policy case) are future work.
+clear error rather than silently degrading: multi-valued inner fields (the grouping-policy case)
+are future work.
+
+Coupled `correlation((<x>, <y>) for x in population) OP r` (`>=`/`>`/`<=`/`<`) is constructed by
+monotone (or anti-monotone) pairing: fuzz a pool, sort each field's values, pair the i-th of each,
+and graft both fields together into a skeleton so the pair holds per individual. Exact `== r`,
+conditional `P(y|x)`, and >2-way coupling are future work.
 """
 
+import ast
 import bisect
 import math
 import random
@@ -94,8 +100,9 @@ _DISTRIBUTION_QUANTILES = {
 
 
 def _requirement_symbols(req: PopulationRequirement) -> list[str]:
-    """The grammar symbols a requirement's inner element reads. One symbol is the marginal
-    (single-field) case v1 constructs; two or more is the row-scoped/coupled case (out of scope)."""
+    """The (sorted, deduplicated) set of grammar symbols a requirement's inner element reads. One
+    symbol is the marginal case; two is a coupled `correlation`. Sorted order is fine for
+    overlap/disjointness checks but NOT for the tuple-position map -- see _coupled_field_symbols."""
     return sorted(
         {
             str(nt)
@@ -103,6 +110,33 @@ def _requirement_symbols(req: PopulationRequirement) -> list[str]:
             for nt in search.get_access_points()
         }
     )
+
+
+def _coupled_field_symbols(req: PopulationRequirement) -> list[str]:
+    """The field per tuple *position* of a coupled inner element, e.g. ``[<x>, <y>]`` for
+    ``correlation((int(<x>), int(<y>)) for ...)`` -- position order, NOT sorted. Construction sorts
+    position-0's values and grafts position-0's field, so the two must line up; using the sorted set
+    would mispair a reversed tuple and collapse the correlation."""
+    elt = ast.parse(req.aggregate.inner_expression, mode="eval").body
+    if not isinstance(elt, ast.Tuple) or len(elt.elts) != 2:
+        raise NotImplementedError(
+            "`correlation`'s inner element must be a 2-tuple, e.g. "
+            "correlation((int(<x>), int(<y>)) for x in population)."
+        )
+    searches = req.aggregate.inner_searches
+    ordered: list[str] = []
+    for sub in elt.elts:
+        names = {n.id for n in ast.walk(sub) if isinstance(n, ast.Name)} & set(searches)
+        access = sorted(
+            {str(nt) for name in names for nt in searches[name].get_access_points()}
+        )
+        if len(access) != 1:
+            raise NotImplementedError(
+                f"Each slot of `correlation`'s (x, y) tuple must read exactly one field; got "
+                f"{access or 'none'}."
+            )
+        ordered.append(access[0])
+    return ordered
 
 
 def _is_prefix(shorter: tuple, longer: tuple) -> bool:
@@ -157,10 +191,19 @@ class PopulationSampler:
             return [self._candidate() for _ in range(n)]
         for req in self.requirements:
             self._validate_requirement(req)
-        if len(self.requirements) == 1:
+        # A lone single-field requirement materializes whole source individuals directly; a coupled
+        # requirement (or several requirements) needs the graft path, which sets each field into a
+        # shared skeleton.
+        if len(self.requirements) == 1 and not self._is_coupled(self.requirements[0]):
             return self._sample_single(self.requirements[0], n)
         self._validate_disjoint()
         return self._sample_joint(n)
+
+    @staticmethod
+    def _is_coupled(req: PopulationRequirement) -> bool:
+        """A requirement that jointly constrains several fields of one individual (only
+        ``correlation`` in v1)."""
+        return req.aggregate.reducer_name == "correlation"
 
     def _validate_requirement(self, req: PopulationRequirement) -> None:
         """Reject, up front, requirement shapes v1 cannot construct: unsupported operators or
@@ -171,11 +214,14 @@ class PopulationSampler:
                 f"Operator '{req.operator.value}' is not supported for a population requirement."
             )
         reducer = req.aggregate.reducer_name
-        constructible = {"fraction", "distinct_count"} | set(_DISTRIBUTION_QUANTILES)
+        constructible = {"fraction", "distinct_count", "correlation"} | set(
+            _DISTRIBUTION_QUANTILES
+        )
         if reducer not in constructible:
             raise NotImplementedError(
-                f"v1 constructs `fraction` quotas, `distinct_count` diversity, and distributional "
-                f"fits ({', '.join(sorted(_DISTRIBUTION_QUANTILES))}); got '{reducer}'."
+                f"v1 constructs `fraction` quotas, `distinct_count` diversity, distributional "
+                f"fits ({', '.join(sorted(_DISTRIBUTION_QUANTILES))}), and `correlation`; got "
+                f"'{reducer}'."
             )
         if reducer in _DISTRIBUTION_QUANTILES and req.operator not in (
             Comparison.LESS_EQUAL,
@@ -185,44 +231,67 @@ class PopulationSampler:
                 f"A distributional fit is a distance to a target; only `<=`/`<` are meaningful "
                 f"(match within delta). Got '{req.operator.value}' for '{reducer}'."
             )
+        if reducer == "correlation" and req.operator is Comparison.EQUAL:
+            raise NotImplementedError(
+                "Constructing toward an exact correlation is future work; use `>=`/`>`/`<=`/`<`."
+            )
         symbols = _requirement_symbols(req)
-        if len(symbols) != 1:
+        if reducer == "correlation":
+            if len(symbols) != 2:
+                raise NotImplementedError(
+                    f"`correlation` constrains exactly two fields (its (x, y) tuple); "
+                    f"'{reducer}(...)' reads {len(symbols)} ({', '.join(symbols)})."
+                )
+        elif len(symbols) != 1:
             raise NotImplementedError(
                 f"v1 constructs single-field requirements; '{reducer}(...)' reads "
                 f"{len(symbols)} symbols ({', '.join(symbols)}). Row-scoped/coupled requirements "
-                f"are future work."
+                f"beyond `correlation` are future work."
             )
 
     def _validate_disjoint(self) -> None:
-        """Multiple requirements must target distinct fields (overlap = same-field joint, out of
-        scope). Nested-field (containment) collisions are caught structurally at graft time."""
+        """Requirements must target distinct fields (any shared symbol = same-field joint, out of
+        scope -- e.g. a coupled field also used by a marginal requirement). Nested-field
+        (containment) collisions are caught structurally at graft time."""
         seen: dict[str, str] = {}
         for req in self.requirements:
-            symbol = _requirement_symbols(req)[0]
-            if symbol in seen:
-                raise FandangoValueError(
-                    f"Two population requirements target the same field {symbol} "
-                    f"('{seen[symbol]}' and '{req.aggregate.reducer_name}'). Jointly constraining "
-                    f"one field with several requirements is future work; use disjoint fields."
-                )
-            seen[symbol] = req.aggregate.reducer_name
+            for symbol in _requirement_symbols(req):
+                if symbol in seen:
+                    raise FandangoValueError(
+                        f"Two population requirements target the same field {symbol} "
+                        f"('{seen[symbol]}' and '{req.aggregate.reducer_name}'). Jointly "
+                        f"constraining one field with several requirements is future work; use "
+                        f"disjoint fields."
+                    )
+                seen[symbol] = req.aggregate.reducer_name
 
-    # -- dispatch: a per-tree column of source trees, then materialize ------- #
-    def _plan(self, req: PopulationRequirement, n: int) -> list[DerivationTree]:
-        """A length-``n`` column of *source* trees (not yet deep-copied) whose target field, if
-        grafted into ``n`` individuals, makes the requirement hold. Reused across single- and
-        multi-requirement sampling."""
+    # -- dispatch: a per-slot {symbol: source individual} column ------------- #
+    def _plan(
+        self, req: PopulationRequirement, n: int
+    ) -> list[dict[str, DerivationTree]]:
+        """A length-``n`` column of per-slot ``{symbol: carrier}`` maps: grafting each carrier's
+        ``symbol`` field into ``n`` individuals makes the requirement hold. Single-field reducers
+        yield one-key maps (carrier = a whole valid individual); coupled ``correlation`` yields
+        two-key maps."""
         reducer = req.aggregate.reducer_name
+        if reducer == "correlation":
+            return self._correlation_plan(req, n)
         if reducer == "fraction":
-            return self._fraction_plan(req, n)
-        if reducer == "distinct_count":
-            return self._distinct_plan(req, n)
-        return self._distribution_plan(req, n)  # validated to be a distributional fit
+            column = self._fraction_plan(req, n)
+        elif reducer == "distinct_count":
+            column = self._distinct_plan(req, n)
+        else:
+            column = self._distribution_plan(req, n)  # validated to be a distributional fit
+        symbol = _requirement_symbols(req)[0]
+        return [{symbol: tree} for tree in column]
 
     def _sample_single(self, req: PopulationRequirement, n: int) -> list[DerivationTree]:
-        """One requirement: materialize its column directly (each source is already a whole,
-        valid individual) and verify."""
-        batch = [tree.deepcopy(copy_parent=False) for tree in self._plan(req, n)]
+        """One single-field requirement: each source is already a whole valid individual, so
+        materialize the column directly (deep-copy) and verify -- no grafting needed."""
+        batch = [
+            next(iter(slot.values())).deepcopy(copy_parent=False)
+            for slot in self._plan(req, n)
+        ]
         self._verify_dispatch(req, batch)
         return batch
 
@@ -235,14 +304,18 @@ class PopulationSampler:
             self._verify(req, inner, batch, self._target_count(req, len(batch)))
         elif reducer == "distinct_count":
             self._verify_distinct(req, inner, batch)
+        elif reducer == "correlation":
+            self._verify_correlation(req, inner, batch)
         else:
             self._verify_fit(req, inner, batch)
 
-    # -- joint construction: graft each field's column into shared skeletons - #
+    # -- graft construction: set each requirement's field(s) into skeletons -- #
     def _sample_joint(self, n: int) -> list[DerivationTree]:
-        """Several disjoint-field requirements: plan a column per requirement, then graft each
-        requirement's chosen field subtree into ``n`` shared skeleton individuals. Disjoint fields
-        mean the grafts don't interfere, so each requirement's verify gate holds independently."""
+        """Graft-based construction (several disjoint-field requirements, or a lone coupled one):
+        plan a per-slot ``{symbol: carrier}`` column per requirement, then graft every requirement's
+        field(s) into ``n`` shared skeleton individuals. Disjoint fields don't interfere, so each
+        requirement's verify gate holds independently; a coupled requirement's two fields are grafted
+        together so the pair holds per individual."""
         skeletons = [self._candidate() for _ in range(n)]
         columns = {i: self._plan(req, n) for i, req in enumerate(self.requirements)}
         batch = self._graft_all(skeletons, columns)
@@ -254,11 +327,18 @@ class PopulationSampler:
     def _graft_all(
         self,
         skeletons: list[DerivationTree],
-        columns: dict[int, list[DerivationTree]],
+        columns: dict[int, list[dict[str, DerivationTree]]],
     ) -> list[DerivationTree]:
-        symbols = [_requirement_symbols(req)[0] for req in self.requirements]
         batch: list[DerivationTree] = []
         for slot, skeleton in enumerate(skeletons):
+            # Every (symbol -> carrier) graft for this individual, across all requirements (a
+            # coupled requirement contributes two).
+            grafts = [
+                (symbol, carrier)
+                for i in range(len(self.requirements))
+                for symbol, carrier in columns[i][slot].items()
+            ]
+            symbols = [symbol for symbol, _ in grafts]
             nodes = []
             for symbol in symbols:
                 found = list(skeleton.find_subtrees(symbol))
@@ -270,14 +350,13 @@ class PopulationSampler:
                 nodes.append(found[0])
             self._reject_nested(nodes, symbols)
             replacements = []
-            for i, (symbol, old) in enumerate(zip(symbols, nodes)):
+            for (symbol, carrier), old in zip(grafts, nodes):
                 if old.read_only:
                     raise NotImplementedError(
                         f"The population field {symbol} is under a generator output (read-only) "
-                        f"and cannot be grafted; combining it with other requirements is future "
-                        f"work."
+                        f"and cannot be grafted; this is future work."
                     )
-                source_field = next(columns[i][slot].find_subtrees(symbol))
+                source_field = next(carrier.find_subtrees(symbol))
                 replacements.append((old, source_field.deepcopy(copy_parent=False)))
             batch.append(skeleton.replace_multiple(self.grammar, replacements))
         return batch
@@ -611,4 +690,52 @@ class PopulationSampler:
                 f"Verification gate failed for '{req.aggregate.reducer_name} "
                 f"{req.operator.value} {req.bound}': assembled batch has fit {actual:.4f}. The "
                 f"grammar may be too coarse to match the target distribution that closely."
+            )
+
+    # -- coupled correlation: pair two fields to reach the target correlation - #
+    def _correlation_plan(
+        self, req: PopulationRequirement, n: int
+    ) -> list[dict[str, DerivationTree]]:
+        """Construct N (x, y) pairs whose Pearson correlation meets the bound, by pairing the two
+        fields' fuzzed values monotonically (for ``>=``/``>``, driving toward +1) or anti-monotonically
+        (for ``<=``/``<``, toward -1). Each slot maps the position-0 field to the source whose x is at
+        that rank and the position-1 field to the source whose y is at the matching rank; grafting
+        both sets the pair per individual. If the marginals are too coarse (low variance/ties) to
+        reach the bound, the verify gate reports a shortfall.
+        """
+        sym_x, sym_y = _coupled_field_symbols(req)  # tuple-position order (NOT sorted)
+        inner = self._inner(req)
+        ascending = req.operator in (Comparison.GREATER, Comparison.GREATER_EQUAL)
+
+        # Pool = N. Oversampling doesn't help: reachability is bounded by marginal variance/ties,
+        # which more candidates can't change (unlike the quantile-coverage distribution pool).
+        pool: list[tuple[float, float, DerivationTree]] = []
+        for _ in range(n):
+            tree = self._candidate()
+            x, y = self._sole_value(inner, tree)  # one (x, y) pair, tuple order
+            pool.append((float(x), float(y), tree))
+
+        x_cands = sorted(((x, t) for x, _, t in pool), key=lambda z: z[0])
+        y_cands = sorted(
+            ((y, t) for _, y, t in pool), key=lambda z: z[0], reverse=not ascending
+        )
+        slots = [
+            {sym_x: x_cands[i][1], sym_y: y_cands[i][1]} for i in range(n)
+        ]
+        random.shuffle(slots)  # shuffle whole maps -- pairing is preserved within each
+        return slots
+
+    def _verify_correlation(
+        self, req: PopulationRequirement, inner: _InnerValue, batch: list[DerivationTree]
+    ) -> None:
+        """Independent gate: the assembled batch's (x, y) correlation must satisfy the operator.
+        ``_correlation`` returns 0.0 for a constant column, so an unreachable bound (e.g. a field
+        with no variance) surfaces here as a shortfall rather than a false success."""
+        pairs = [self._sole_value(inner, tree) for tree in batch]
+        actual = REDUCERS["correlation"](pairs)
+        if not req.operator.compare(actual, req.bound):
+            raise PopulationShortfallError(
+                f"Verification gate failed for 'correlation {req.operator.value} {req.bound}': "
+                f"assembled batch has correlation {actual:.4f}. The marginals may be too coarse "
+                f"(low variance or ties) to reach that bound."
             )
