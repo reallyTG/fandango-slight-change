@@ -18,11 +18,17 @@ v1 covers three construction cases, all requiring exactly one inner value per in
   fuzzes a candidate pool and selects, for each order-statistic slot, the individual whose value is
   nearest the target quantile, so the batch's distribution matches the target within delta.
 
-A final verification gate re-checks the assembled batch in every case, and per-tree hard
-constraints from the spec are co-enforced -- every constructed individual is drawn to satisfy them
-(the candidate source rejection-fuzzes). Everything else raises a clear error rather than silently
-degrading: multiple population requirements at once and multi-valued inner fields (the
-grouping-policy case) are future work.
+Multiple population requirements are combined when they target **disjoint fields**: each requirement
+plans a per-tree column of source individuals (via the same selection logic), and the chosen field
+subtree is grafted into shared skeleton individuals -- disjoint fields mean the grafts don't
+interfere, so each requirement's verify gate holds independently. Requirements on the same field, or
+whose fields nest, are rejected.
+
+A final verification gate re-checks the assembled batch in every case, and per-tree hard constraints
+from the spec are co-enforced -- every constructed individual is drawn to satisfy them (the
+candidate source rejection-fuzzes; grafted individuals are re-checked). Everything else raises a
+clear error rather than silently degrading: multi-symbol (row-scoped/coupled) requirements and
+multi-valued inner fields (the grouping-policy case) are future work.
 """
 
 import bisect
@@ -87,6 +93,23 @@ _DISTRIBUTION_QUANTILES = {
 }
 
 
+def _requirement_symbols(req: PopulationRequirement) -> list[str]:
+    """The grammar symbols a requirement's inner element reads. One symbol is the marginal
+    (single-field) case v1 constructs; two or more is the row-scoped/coupled case (out of scope)."""
+    return sorted(
+        {
+            str(nt)
+            for search in req.aggregate.inner_searches.values()
+            for nt in search.get_access_points()
+        }
+    )
+
+
+def _is_prefix(shorter: tuple, longer: tuple) -> bool:
+    """True if ``shorter`` is a (proper or equal) path prefix of ``longer``."""
+    return len(shorter) <= len(longer) and tuple(longer[: len(shorter)]) == tuple(shorter)
+
+
 class PopulationShortfallError(FandangoValueError):
     """Raised when the sampler cannot assemble a batch meeting a requirement within budget."""
 
@@ -132,27 +155,162 @@ class PopulationSampler:
             raise FandangoValueError(f"Population size must be positive; got {n}.")
         if not self.requirements:
             return [self._candidate() for _ in range(n)]
-        if len(self.requirements) > 1:
-            raise NotImplementedError(
-                f"v1 supports a single population requirement; got {len(self.requirements)}. "
-                f"Jointly satisfying multiple requirements is future work."
-            )
-        req = self.requirements[0]
+        for req in self.requirements:
+            self._validate_requirement(req)
+        if len(self.requirements) == 1:
+            return self._sample_single(self.requirements[0], n)
+        self._validate_disjoint()
+        return self._sample_joint(n)
+
+    def _validate_requirement(self, req: PopulationRequirement) -> None:
+        """Reject, up front, requirement shapes v1 cannot construct: unsupported operators or
+        reducers, an ``>=``/``>``/``==`` on a distributional fit (a distance has no such target),
+        and multi-symbol (row-scoped/coupled) inner elements."""
         if req.operator not in _CONSTRUCTIBLE_OPERATORS:
             raise NotImplementedError(
                 f"Operator '{req.operator.value}' is not supported for a population requirement."
             )
         reducer = req.aggregate.reducer_name
+        constructible = {"fraction", "distinct_count"} | set(_DISTRIBUTION_QUANTILES)
+        if reducer not in constructible:
+            raise NotImplementedError(
+                f"v1 constructs `fraction` quotas, `distinct_count` diversity, and distributional "
+                f"fits ({', '.join(sorted(_DISTRIBUTION_QUANTILES))}); got '{reducer}'."
+            )
+        if reducer in _DISTRIBUTION_QUANTILES and req.operator not in (
+            Comparison.LESS_EQUAL,
+            Comparison.LESS,
+        ):
+            raise NotImplementedError(
+                f"A distributional fit is a distance to a target; only `<=`/`<` are meaningful "
+                f"(match within delta). Got '{req.operator.value}' for '{reducer}'."
+            )
+        symbols = _requirement_symbols(req)
+        if len(symbols) != 1:
+            raise NotImplementedError(
+                f"v1 constructs single-field requirements; '{reducer}(...)' reads "
+                f"{len(symbols)} symbols ({', '.join(symbols)}). Row-scoped/coupled requirements "
+                f"are future work."
+            )
+
+    def _validate_disjoint(self) -> None:
+        """Multiple requirements must target distinct fields (overlap = same-field joint, out of
+        scope). Nested-field (containment) collisions are caught structurally at graft time."""
+        seen: dict[str, str] = {}
+        for req in self.requirements:
+            symbol = _requirement_symbols(req)[0]
+            if symbol in seen:
+                raise FandangoValueError(
+                    f"Two population requirements target the same field {symbol} "
+                    f"('{seen[symbol]}' and '{req.aggregate.reducer_name}'). Jointly constraining "
+                    f"one field with several requirements is future work; use disjoint fields."
+                )
+            seen[symbol] = req.aggregate.reducer_name
+
+    # -- dispatch: a per-tree column of source trees, then materialize ------- #
+    def _plan(self, req: PopulationRequirement, n: int) -> list[DerivationTree]:
+        """A length-``n`` column of *source* trees (not yet deep-copied) whose target field, if
+        grafted into ``n`` individuals, makes the requirement hold. Reused across single- and
+        multi-requirement sampling."""
+        reducer = req.aggregate.reducer_name
         if reducer == "fraction":
-            return self._sample_fraction(req, n)
+            return self._fraction_plan(req, n)
         if reducer == "distinct_count":
-            return self._sample_distinct(req, n)
-        if reducer in _DISTRIBUTION_QUANTILES:
-            return self._sample_distribution(req, n)
-        raise NotImplementedError(
-            f"v1 constructs `fraction` quotas, `distinct_count` diversity, and distributional "
-            f"fits ({', '.join(sorted(_DISTRIBUTION_QUANTILES))}); got '{reducer}'."
-        )
+            return self._distinct_plan(req, n)
+        return self._distribution_plan(req, n)  # validated to be a distributional fit
+
+    def _sample_single(self, req: PopulationRequirement, n: int) -> list[DerivationTree]:
+        """One requirement: materialize its column directly (each source is already a whole,
+        valid individual) and verify."""
+        batch = [tree.deepcopy(copy_parent=False) for tree in self._plan(req, n)]
+        self._verify_dispatch(req, batch)
+        return batch
+
+    def _verify_dispatch(
+        self, req: PopulationRequirement, batch: list[DerivationTree]
+    ) -> None:
+        inner = self._inner(req)
+        reducer = req.aggregate.reducer_name
+        if reducer == "fraction":
+            self._verify(req, inner, batch, self._target_count(req, len(batch)))
+        elif reducer == "distinct_count":
+            self._verify_distinct(req, inner, batch)
+        else:
+            self._verify_fit(req, inner, batch)
+
+    # -- joint construction: graft each field's column into shared skeletons - #
+    def _sample_joint(self, n: int) -> list[DerivationTree]:
+        """Several disjoint-field requirements: plan a column per requirement, then graft each
+        requirement's chosen field subtree into ``n`` shared skeleton individuals. Disjoint fields
+        mean the grafts don't interfere, so each requirement's verify gate holds independently."""
+        skeletons = [self._candidate() for _ in range(n)]
+        columns = {i: self._plan(req, n) for i, req in enumerate(self.requirements)}
+        batch = self._graft_all(skeletons, columns)
+        for req in self.requirements:
+            self._verify_dispatch(req, batch)
+        self._recheck_constraints(batch)
+        return batch
+
+    def _graft_all(
+        self,
+        skeletons: list[DerivationTree],
+        columns: dict[int, list[DerivationTree]],
+    ) -> list[DerivationTree]:
+        symbols = [_requirement_symbols(req)[0] for req in self.requirements]
+        batch: list[DerivationTree] = []
+        for slot, skeleton in enumerate(skeletons):
+            nodes = []
+            for symbol in symbols:
+                found = list(skeleton.find_subtrees(symbol))
+                if len(found) != 1:
+                    raise NotImplementedError(
+                        f"v1 requires exactly one {symbol} per individual for grafting; got "
+                        f"{len(found)}. Multi-valued fields need the grouping policy (future work)."
+                    )
+                nodes.append(found[0])
+            self._reject_nested(nodes, symbols)
+            replacements = []
+            for i, (symbol, old) in enumerate(zip(symbols, nodes)):
+                if old.read_only:
+                    raise NotImplementedError(
+                        f"The population field {symbol} is under a generator output (read-only) "
+                        f"and cannot be grafted; combining it with other requirements is future "
+                        f"work."
+                    )
+                source_field = next(columns[i][slot].find_subtrees(symbol))
+                replacements.append((old, source_field.deepcopy(copy_parent=False)))
+            batch.append(skeleton.replace_multiple(self.grammar, replacements))
+        return batch
+
+    def _reject_nested(
+        self, nodes: list[DerivationTree], symbols: list[str]
+    ) -> None:
+        """Distinct symbols can still collide if one field derives *under* another; a graft into
+        the outer node would clobber the inner. Detect it structurally: reject if any node's choice
+        path is a prefix of another's."""
+        paths = [node.get_choices_path() for node in nodes]
+        for a in range(len(paths)):
+            for b in range(len(paths)):
+                if a != b and _is_prefix(paths[a], paths[b]):
+                    raise FandangoValueError(
+                        f"Population requirement fields {symbols[a]} and {symbols[b]} are nested "
+                        f"(one derives under the other); v1 needs structurally disjoint fields."
+                    )
+
+    def _recheck_constraints(self, batch: list[DerivationTree]) -> None:
+        """A grafted individual mixes the skeleton's untouched fields with a grafted field; if a
+        per-tree constraint reads a grafted field it may now be violated. Re-check every tree and
+        shortfall rather than silently emit an invalid individual."""
+        if not self._constraints:
+            return
+        for tree in batch:
+            if not all(constraint.check(tree) for constraint in self._constraints):
+                raise PopulationShortfallError(
+                    "A grafted individual violates a per-tree constraint (a constraint reads a "
+                    "field set by a population requirement). Per-slot validity-aware selection is "
+                    "future work; make the per-tree constraint and the requirement target "
+                    "different fields."
+                )
 
     def _candidate(self) -> DerivationTree:
         """A freshly fuzzed individual that satisfies every per-tree hard constraint.
@@ -194,8 +352,8 @@ class PopulationSampler:
             )
         return values[0]
 
-    # -- fraction quota construction ---------------------------------------- #
-    def _sample_fraction(self, req: PopulationRequirement, n: int) -> list[DerivationTree]:
+    # -- fraction quota: bucket source individuals by the predicate --------- #
+    def _fraction_plan(self, req: PopulationRequirement, n: int) -> list[DerivationTree]:
         target_true = self._target_count(req, n)
         target_false = n - target_true
         inner = self._inner(req)
@@ -221,10 +379,9 @@ class PopulationSampler:
             elif len(false_bucket) < target_false:
                 false_bucket.append(tree)
 
-        batch = true_bucket + false_bucket
-        random.shuffle(batch)
-        self._verify(req, inner, batch, target_true)
-        return batch
+        column = true_bucket + false_bucket
+        random.shuffle(column)
+        return column
 
     def _target_count(self, req: PopulationRequirement, n: int) -> int:
         """The number of individuals that must satisfy the predicate for ``req`` to hold at N.
@@ -288,16 +445,14 @@ class PopulationSampler:
                 f"assembled batch has {achieved} satisfying individuals, expected {target_true}."
             )
 
-    # -- distinct-value diversity construction ------------------------------ #
-    def _sample_distinct(self, req: PopulationRequirement, n: int) -> list[DerivationTree]:
+    # -- distinct-value diversity: gather representatives, fill by reuse ----- #
+    def _distinct_plan(self, req: PopulationRequirement, n: int) -> list[DerivationTree]:
         target, mode = self._target_distinct(req, n)
         inner = self._inner(req)
 
-        # `>= 0` (or `< 1` -> handled as infeasible) imposes nothing; just fuzz a plain batch.
+        # `>= 0` (or `< 1` -> handled as infeasible) imposes nothing; a plain batch suffices.
         if target <= 0:
-            batch = [self._candidate() for _ in range(n)]
-            self._verify_distinct(req, inner, batch)
-            return batch
+            return [self._candidate() for _ in range(n)]
 
         # We never need more than N distinct values in an N-tree batch.
         gather_target = min(target, n)
@@ -325,19 +480,18 @@ class PopulationSampler:
                 reps[value] = tree
 
         rep_trees = list(reps.values())
-        batch: list[DerivationTree] = list(rep_trees)
-        # Fill the remaining slots by reusing representatives (deep-copied so each batch entry is
-        # an independent tree), cycling through them -- this keeps the distinct count exactly
-        # len(reps) without re-fuzzing, so a high-cardinality grammar can't cause a false shortfall.
+        column: list[DerivationTree] = list(rep_trees)
+        # Fill the remaining slots by *reusing* representatives (same source object repeated -- the
+        # materialization/graft step deep-copies, so entries stay independent). This keeps the
+        # distinct count exactly len(reps) without re-fuzzing, so a high-cardinality grammar can't
+        # cause a false shortfall.
         i = 0
-        while len(batch) < n:
-            src = rep_trees[i % len(rep_trees)]
-            batch.append(src.deepcopy(copy_parent=False))
+        while len(column) < n:
+            column.append(rep_trees[i % len(rep_trees)])
             i += 1
 
-        random.shuffle(batch)
-        self._verify_distinct(req, inner, batch)
-        return batch
+        random.shuffle(column)
+        return column
 
     def _target_distinct(self, req: PopulationRequirement, n: int) -> tuple[int, str]:
         """The distinct-value count to construct toward, and the mode:
@@ -397,8 +551,8 @@ class PopulationSampler:
                 f"assembled batch has {actual} distinct values."
             )
 
-    # -- distributional-shape construction ---------------------------------- #
-    def _sample_distribution(
+    # -- distributional shape: select the pool tree nearest each quantile --- #
+    def _distribution_plan(
         self, req: PopulationRequirement, n: int
     ) -> list[DerivationTree]:
         """Match a target distribution: ``normal_fit([<x> for x in population], ...) <= delta``.
@@ -411,11 +565,6 @@ class PopulationSampler:
         ``delta``, the verification gate reports a shortfall rather than a false success.
         """
         reducer = req.aggregate.reducer_name
-        if req.operator not in (Comparison.LESS_EQUAL, Comparison.LESS):
-            raise NotImplementedError(
-                f"A distributional fit is a distance to a target; only `<=`/`<` are meaningful "
-                f"(match within delta). Got '{req.operator.value}' for '{reducer}'."
-            )
         quantile = _DISTRIBUTION_QUANTILES[reducer](*req.aggregate.reducer_args)
         inner = self._inner(req)
 
@@ -437,7 +586,7 @@ class PopulationSampler:
 
         pool.sort(key=lambda vt: vt[0])
         pool_values = [v for v, _ in pool]
-        batch: list[DerivationTree] = []
+        column: list[DerivationTree] = []
         for i in range(n):
             q = quantile((i + 0.5) / n)
             j = bisect.bisect_left(pool_values, q)
@@ -445,11 +594,10 @@ class PopulationSampler:
                 (k for k in (j - 1, j, j + 1) if 0 <= k < len(pool)),
                 key=lambda k: abs(pool_values[k] - q),
             )
-            batch.append(pool[nearest][1].deepcopy(copy_parent=False))
+            column.append(pool[nearest][1])
 
-        random.shuffle(batch)
-        self._verify_fit(req, inner, batch)
-        return batch
+        random.shuffle(column)
+        return column
 
     def _verify_fit(
         self, req: PopulationRequirement, inner: _InnerValue, batch: list[DerivationTree]

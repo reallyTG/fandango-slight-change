@@ -101,12 +101,13 @@ class TestPopulationSamplerHonestLimits(unittest.TestCase):
     def setUp(self):
         random.seed(0)
 
-    def test_multiple_requirements_raise(self):
+    def test_overlapping_requirements_raise(self):
+        # Two requirements on the SAME field (<income>) cannot be jointly constructed in v1.
         grammar = _grammar_with(
             "where fraction(int(<income>) == 1 for x in population) == 0.30",
             "where fraction(int(<income>) == 0 for x in population) >= 0.10",
         )
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaises(FandangoValueError):
             PopulationSampler(grammar).sample(10)
 
     def test_unsupported_reducer_raises(self):
@@ -331,6 +332,108 @@ class TestPopulationSamplerCoEnforcement(unittest.TestCase):
             ).sample(10)
 
 
+# Flat record: three sibling fields, so requirements on them are structurally disjoint.
+JOINT_GRAMMAR = (
+    '<start> ::= <income> "," <occ> "," <age> "\\n"\n'
+    '<income> ::= "0" | "1"\n'
+    '<occ> ::= "eng" | "doc" | "art" | "law" | "edu"\n'
+    "<age> ::= r'[0-9][0-9]'\n"
+)
+
+
+def _joint_grammar(*where_lines, grammar_src=JOINT_GRAMMAR):
+    spec = grammar_src + "\n" + "\n".join(where_lines) + "\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".fan", delete=False) as f:
+        f.write(spec)
+        path = f.name
+    try:
+        with open(path) as f:
+            return parse(f, use_stdlib=False, use_cache=False)
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
+def _fields(batch):
+    """(income, occ, age) columns from a batch of `<income>,<occ>,<age>` records."""
+    rows = [str(t).strip().split(",") for t in batch]
+    return (
+        [int(r[0]) for r in rows],
+        [r[1] for r in rows],
+        [int(r[2]) for r in rows],
+    )
+
+
+class TestPopulationSamplerJoint(unittest.TestCase):
+    """Multiple population requirements on disjoint fields, constructed together by grafting."""
+
+    def setUp(self):
+        random.seed(0)
+
+    def test_three_disjoint_requirements_all_hold(self):
+        grammar, constraints = _joint_grammar(
+            "where fraction(int(<income>) == 1 for x in population) == 0.30",
+            "where distinct_count(<occ> for x in population) >= 3",
+            "where normal_fit([int(<age>) for x in population], 30, 5) <= 0.6",
+        )
+        batch = PopulationSampler(grammar, constraints=constraints).sample(30)
+        incomes, occs, ages = _fields(batch)
+        self.assertEqual(len(batch), 30)
+        self.assertEqual(REDUCERS["fraction"]([i == 1 for i in incomes]), 0.30)
+        self.assertGreaterEqual(REDUCERS["distinct_count"](occs), 3)
+        self.assertLessEqual(REDUCERS["normal_fit"](ages, 30, 5), 0.6)
+
+    def test_two_disjoint_fractions(self):
+        grammar, constraints = _joint_grammar(
+            "where fraction(int(<income>) == 1 for x in population) == 0.30",
+            "where fraction(int(<age>) >= 50 for x in population) == 0.50",
+        )
+        batch = PopulationSampler(grammar, constraints=constraints).sample(20)
+        incomes, _, ages = _fields(batch)
+        self.assertEqual(REDUCERS["fraction"]([i == 1 for i in incomes]), 0.30)
+        self.assertEqual(REDUCERS["fraction"]([a >= 50 for a in ages]), 0.50)
+
+    def test_overlapping_fields_rejected(self):
+        grammar, constraints = _joint_grammar(
+            "where distinct_count(<occ> for x in population) >= 3",
+            "where fraction(<occ> == 'eng' for x in population) == 0.20",
+        )
+        with self.assertRaises(FandangoValueError):
+            PopulationSampler(grammar, constraints=constraints).sample(20)
+
+    def test_multi_symbol_requirement_rejected(self):
+        # Inner reads two symbols (<income> and <age>) -> row-scoped/coupled, out of scope.
+        grammar, constraints = _joint_grammar(
+            "where fraction((int(<income>) == 1 and int(<age>) >= 30) for x in population) == 0.30",
+        )
+        with self.assertRaises(NotImplementedError):
+            PopulationSampler(grammar, constraints=constraints).sample(20)
+
+    def test_nested_fields_rejected(self):
+        # <age> derives under <person>; distinct symbols but their grafts would collide.
+        src = (
+            '<start> ::= <person> "\\n"\n'
+            '<person> ::= <name> "," <age>\n'
+            '<name> ::= "x" | "y" | "z"\n'
+            "<age> ::= r'[0-9][0-9]'\n"
+        )
+        grammar, constraints = _joint_grammar(
+            "where distinct_count(<person> for x in population) >= 2",
+            "where fraction(int(<age>) >= 50 for x in population) == 0.50",
+            grammar_src=src,
+        )
+        with self.assertRaises(FandangoValueError):
+            PopulationSampler(grammar, constraints=constraints).sample(10)
+
+    def test_joint_infeasible_subrequirement_raises(self):
+        # distinct_count >= 25 at N=20 is infeasible (can't hold 25 distinct in 20 individuals).
+        grammar, constraints = _joint_grammar(
+            "where fraction(int(<income>) == 1 for x in population) == 0.30",
+            "where distinct_count(<occ> for x in population) >= 25",
+        )
+        with self.assertRaises(FandangoValueError):
+            PopulationSampler(grammar, constraints=constraints).sample(20)
+
+
 class TestPopulationSamplerEndToEnd(unittest.TestCase):
     """Through the public `Fandango.fuzz` API: a population `where` routes to the sampler."""
 
@@ -378,6 +481,25 @@ class TestPopulationSamplerEndToEnd(unittest.TestCase):
         self.assertEqual(len(batch), 30)
         ages = [int(str(t).strip()) for t in batch]
         self.assertLessEqual(REDUCERS["normal_fit"](ages, 30, 5), 0.5)
+
+    JOINT_SPEC = (
+        '<start> ::= <income> "," <occ> "," <age> "\\n"\n'
+        '<income> ::= "0" | "1"\n'
+        '<occ> ::= "eng" | "doc" | "art" | "law" | "edu"\n'
+        "<age> ::= r'[0-9][0-9]'\n"
+        "where fraction(int(<income>) == 1 for x in population) == 0.30\n"
+        "where distinct_count(<occ> for x in population) >= 3\n"
+        "where normal_fit([int(<age>) for x in population], 30, 5) <= 0.6\n"
+    )
+
+    def test_fuzz_constructs_joint_batch(self):
+        fan = Fandango(self.JOINT_SPEC)
+        batch = fan.fuzz(desired_solutions=30)
+        self.assertEqual(len(batch), 30)
+        rows = [str(t).strip().split(",") for t in batch]
+        self.assertEqual(REDUCERS["fraction"]([int(r[0]) == 1 for r in rows]), 0.30)
+        self.assertGreaterEqual(REDUCERS["distinct_count"]([r[1] for r in rows]), 3)
+        self.assertLessEqual(REDUCERS["normal_fit"]([int(r[2]) for r in rows], 30, 5), 0.6)
 
     def test_per_tree_constraint_is_co_enforced_via_fuzz(self):
         # income quota at the batch level + a per-tree lower bound on an independent age field.
