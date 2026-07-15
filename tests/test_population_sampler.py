@@ -109,9 +109,10 @@ class TestPopulationSamplerHonestLimits(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             PopulationSampler(grammar).sample(10)
 
-    def test_non_fraction_reducer_raises(self):
+    def test_unsupported_reducer_raises(self):
+        # fraction (quota) and distinct_count (diversity) are constructed; mean is not (yet).
         grammar = _grammar_with(
-            "where distinct_count(<income> for x in population) >= 2"
+            "where mean(int(<income>) for x in population) <= 1"
         )
         with self.assertRaises(NotImplementedError):
             PopulationSampler(grammar).sample(10)
@@ -132,6 +133,89 @@ class TestPopulationSamplerHonestLimits(unittest.TestCase):
             PopulationSampler(grammar).sample(10)
 
 
+OCC_GRAMMAR = (
+    '<start> ::= <occ> "\\n"\n<occ> ::= "eng" | "doc" | "art" | "law" | "edu"\n'  # 5 values
+)
+
+
+def _occ_grammar_with(where_line: str):
+    spec = OCC_GRAMMAR + "\n" + where_line + "\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".fan", delete=False) as f:
+        f.write(spec)
+        path = f.name
+    try:
+        with open(path) as f:
+            grammar, _ = parse(f, use_stdlib=False, use_cache=False)
+        return grammar
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
+def _distinct(batch):
+    return len({str(t).strip() for t in batch})
+
+
+class TestPopulationSamplerDiversity(unittest.TestCase):
+    """distinct_count(<field>) OP K: build a batch with the required number of distinct values."""
+
+    def setUp(self):
+        random.seed(0)
+
+    def test_at_least_builds_target_distinct(self):
+        batch = PopulationSampler(
+            _occ_grammar_with("where distinct_count(<occ> for x in population) >= 3")
+        ).sample(20)
+        self.assertEqual(len(batch), 20)
+        self.assertGreaterEqual(_distinct(batch), 3)
+
+    def test_exact_distinct(self):
+        batch = PopulationSampler(
+            _occ_grammar_with("where distinct_count(<occ> for x in population) == 4")
+        ).sample(20)
+        self.assertEqual(_distinct(batch), 4)
+
+    def test_greater_than_boundary(self):
+        batch = PopulationSampler(
+            _occ_grammar_with("where distinct_count(<occ> for x in population) > 3")
+        ).sample(20)
+        self.assertGreater(_distinct(batch), 3)
+
+    def test_at_most_caps_distinct(self):
+        batch = PopulationSampler(
+            _occ_grammar_with("where distinct_count(<occ> for x in population) <= 2")
+        ).sample(20)
+        self.assertEqual(len(batch), 20)
+        self.assertLessEqual(_distinct(batch), 2)
+
+    def test_less_than_boundary(self):
+        batch = PopulationSampler(
+            _occ_grammar_with("where distinct_count(<occ> for x in population) < 3")
+        ).sample(20)
+        self.assertLess(_distinct(batch), 3)
+
+    def test_more_distinct_than_grammar_can_produce_shortfalls(self):
+        # The grammar has only 5 distinct occupations; 6 is unreachable.
+        grammar = _occ_grammar_with(
+            "where distinct_count(<occ> for x in population) >= 6"
+        )
+        with self.assertRaises(PopulationShortfallError):
+            PopulationSampler(grammar, max_attempts_per_slot=50).sample(20)
+
+    def test_more_distinct_than_batch_size_is_infeasible(self):
+        grammar = _occ_grammar_with(
+            "where distinct_count(<occ> for x in population) >= 4"
+        )
+        with self.assertRaises(FandangoValueError):
+            PopulationSampler(grammar).sample(3)
+
+    def test_non_integer_exact_target_is_rejected(self):
+        grammar = _occ_grammar_with(
+            "where distinct_count(<occ> for x in population) == 2.5"
+        )
+        with self.assertRaises(FandangoValueError):
+            PopulationSampler(grammar).sample(20)
+
+
 class TestPopulationSamplerEndToEnd(unittest.TestCase):
     """Through the public `Fandango.fuzz` API: a population `where` routes to the sampler."""
 
@@ -139,6 +223,12 @@ class TestPopulationSamplerEndToEnd(unittest.TestCase):
         '<start> ::= <income> "\\n"\n'
         '<income> ::= "0" | "1"\n'
         "where fraction(int(<income>) == 1 for x in population) == 0.30\n"
+    )
+
+    OCC_SPEC = (
+        '<start> ::= <occ> "\\n"\n'
+        '<occ> ::= "eng" | "doc" | "art" | "law" | "edu"\n'
+        "where distinct_count(<occ> for x in population) >= 4\n"
     )
 
     def setUp(self):
@@ -154,6 +244,12 @@ class TestPopulationSamplerEndToEnd(unittest.TestCase):
         fan = Fandango(self.SPEC)
         with self.assertRaises(FandangoValueError):
             fan.fuzz()
+
+    def test_fuzz_constructs_the_diverse_batch(self):
+        fan = Fandango(self.OCC_SPEC)
+        batch = fan.fuzz(desired_solutions=20)
+        self.assertEqual(len(batch), 20)
+        self.assertGreaterEqual(_distinct(batch), 4)
 
     def test_per_tree_hard_constraint_alongside_requirement_raises(self):
         spec = self.SPEC + "where int(<income>) >= 0\n"

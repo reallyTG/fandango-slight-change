@@ -5,17 +5,20 @@ guarantee over the whole emitted batch of N -- something no single individual ca
 that streaming, per-tree evolution cannot express. This sampler sits *above* the GA and
 constructs such a batch directly.
 
-v1 covers the exact-by-construction **quota** case: a single
-``fraction(<pred> for x in population) OP p`` requirement whose inner element yields exactly one
-boolean per individual. It buckets freshly-fuzzed individuals by the predicate and assembles the
-target count, so the resulting batch hits the fraction exactly (for ``==``, snapped to the
-nearest achievable ``round(p*N)/N``) or the operator's boundary (for the inequalities). A final
-verification gate re-checks the assembled batch.
+v1 covers two exact-by-construction cases, both requiring exactly one inner value per individual:
 
-Everything outside that slice raises a clear error rather than silently degrading:
-multiple requirements, non-``fraction`` reducers (distributional fits, ``distinct_count``
-diversity), multi-valued inner fields (the grouping-policy case), and per-tree hard constraints
-alongside a requirement are all future work.
+- **fraction quota** -- ``fraction(<pred> for x in population) OP p``: buckets fuzzed individuals
+  by the boolean predicate and assembles the target count, hitting the fraction exactly (for
+  ``==``, snapped to the nearest achievable ``round(p*N)/N``) or the operator's boundary.
+- **distinct-value diversity** -- ``distinct_count(<field> for x in population) OP K``: collects
+  representatives until the required number of *distinct* field values is reached (``>=``/``>``/
+  ``==``) or capped (``<=``/``<``), then fills the batch by reusing those representatives so the
+  distinct count lands exactly on target.
+
+A final verification gate re-checks the assembled batch in both cases. Everything else raises a
+clear error rather than silently degrading: multiple requirements, distributional fits
+(``normal_fit`` &c.), multi-valued inner fields (the grouping-policy case), and per-tree hard
+constraints alongside a requirement are all future work.
 """
 
 import math
@@ -33,9 +36,9 @@ from fandango.language.grammar.grammar import Grammar
 from fandango.language.tree import DerivationTree
 from fandango.logger import LOGGER
 
-# Operators the quota path can construct toward. ``!=`` is intentionally excluded: "not exactly
-# 30%" is an odd guarantee and has no natural construction target.
-_QUOTA_OPERATORS = frozenset(
+# Comparison operators the sampler can construct toward. ``!=`` is intentionally excluded: "not
+# exactly 30%" / "not exactly K distinct" is an odd guarantee with no natural construction target.
+_CONSTRUCTIBLE_OPERATORS = frozenset(
     {
         Comparison.EQUAL,
         Comparison.GREATER_EQUAL,
@@ -88,30 +91,48 @@ class PopulationSampler:
                 f"v1 supports a single population requirement; got {len(self.requirements)}. "
                 f"Jointly satisfying multiple requirements is future work."
             )
-        return self._sample_quota(self.requirements[0], n)
-
-    # -- quota construction ------------------------------------------------- #
-    def _sample_quota(self, req: PopulationRequirement, n: int) -> list[DerivationTree]:
+        req = self.requirements[0]
+        if req.operator not in _CONSTRUCTIBLE_OPERATORS:
+            raise NotImplementedError(
+                f"Operator '{req.operator.value}' is not supported for a population requirement."
+            )
         reducer = req.aggregate.reducer_name
-        if reducer != "fraction":
-            raise NotImplementedError(
-                f"v1 construction supports only the `fraction` quota; got '{reducer}'. "
-                f"Distributional fits and diversity (`distinct_count`) requirements are "
-                f"future work."
-            )
-        if req.operator not in _QUOTA_OPERATORS:
-            raise NotImplementedError(
-                f"Operator '{req.operator.value}' is not supported for a fraction quota."
-            )
+        if reducer == "fraction":
+            return self._sample_fraction(req, n)
+        if reducer == "distinct_count":
+            return self._sample_distinct(req, n)
+        raise NotImplementedError(
+            f"v1 constructs `fraction` quotas and `distinct_count` diversity; got '{reducer}'. "
+            f"Distributional fits (normal_fit, ...) are future work."
+        )
 
-        target_true = self._target_count(req, n)
-        target_false = n - target_true
-        inner = _InnerValue(
+    def _inner(self, req: PopulationRequirement) -> _InnerValue:
+        """A per-tree evaluator for the requirement's inner element."""
+        return _InnerValue(
             req.aggregate.inner_expression,
             searches=req.aggregate.inner_searches,
             global_variables=self._global_variables,
             local_variables=self._local_variables,
         )
+
+    def _sole_value(self, inner: _InnerValue, tree: DerivationTree) -> Any:
+        """The single inner value for one individual (each individual = one record in v1).
+
+        A tree yielding several values is the pooled/multiplicity case (grouping policy) and is
+        not yet supported."""
+        values = inner.raw_values(tree)
+        if len(values) != 1:
+            raise NotImplementedError(
+                f"v1 requires exactly one inner value per individual, but one tree yielded "
+                f"{len(values)}. Multi-valued fields need the grouping policy (future work)."
+            )
+        return values[0]
+
+    # -- fraction quota construction ---------------------------------------- #
+    def _sample_fraction(self, req: PopulationRequirement, n: int) -> list[DerivationTree]:
+        target_true = self._target_count(req, n)
+        target_false = n - target_true
+        inner = self._inner(req)
 
         true_bucket: list[DerivationTree] = []
         false_bucket: list[DerivationTree] = []
@@ -180,19 +201,8 @@ class PopulationSampler:
         return target
 
     def _predicate_value(self, inner: _InnerValue, tree: DerivationTree) -> bool:
-        """Evaluate the inner boolean predicate against one individual.
-
-        v1 requires exactly one inner value per tree (each individual = one record). A tree
-        yielding several values is the pooled/multiplicity case (grouping policy) and is not
-        yet supported.
-        """
-        values = inner.raw_values(tree)
-        if len(values) != 1:
-            raise NotImplementedError(
-                f"v1 requires exactly one inner value per individual, but one tree yielded "
-                f"{len(values)}. Multi-valued fields need the grouping policy (future work)."
-            )
-        return bool(values[0])
+        """Evaluate the inner boolean predicate against one individual."""
+        return bool(self._sole_value(inner, tree))
 
     def _verify(
         self,
@@ -210,4 +220,113 @@ class PopulationSampler:
             raise PopulationShortfallError(
                 f"Verification gate failed for 'fraction {req.operator.value} {req.bound}': "
                 f"assembled batch has {achieved} satisfying individuals, expected {target_true}."
+            )
+
+    # -- distinct-value diversity construction ------------------------------ #
+    def _sample_distinct(self, req: PopulationRequirement, n: int) -> list[DerivationTree]:
+        target, mode = self._target_distinct(req, n)
+        inner = self._inner(req)
+
+        # `>= 0` (or `< 1` -> handled as infeasible) imposes nothing; just fuzz a plain batch.
+        if target <= 0:
+            batch = [self.grammar.fuzz() for _ in range(n)]
+            self._verify_distinct(req, inner, batch)
+            return batch
+
+        # We never need more than N distinct values in an N-tree batch.
+        gather_target = min(target, n)
+        cap = self._max_attempts_per_slot * n
+
+        # Gather one representative individual per distinct field value. "reach" mode must find
+        # `gather_target` distinct values (else the grammar can't meet the requirement ->
+        # shortfall); "cap" mode takes up to that many and stops early if fuzzing runs dry.
+        reps: dict[Any, DerivationTree] = {}
+        attempts = 0
+        while len(reps) < gather_target:
+            if attempts >= cap:
+                if mode == "reach":
+                    raise PopulationShortfallError(
+                        f"Could not find {target} distinct values for "
+                        f"'distinct_count {req.operator.value} {req.bound}' at N={n} within {cap} "
+                        f"fuzzing attempts (found {len(reps)}). The grammar may not produce that "
+                        f"many distinct values."
+                    )
+                break  # "cap": fewer distinct values than the cap is fine (<=/< still holds)
+            attempts += 1
+            tree = self.grammar.fuzz()
+            value = self._sole_value(inner, tree)
+            if value not in reps:
+                reps[value] = tree
+
+        rep_trees = list(reps.values())
+        batch: list[DerivationTree] = list(rep_trees)
+        # Fill the remaining slots by reusing representatives (deep-copied so each batch entry is
+        # an independent tree), cycling through them -- this keeps the distinct count exactly
+        # len(reps) without re-fuzzing, so a high-cardinality grammar can't cause a false shortfall.
+        i = 0
+        while len(batch) < n:
+            src = rep_trees[i % len(rep_trees)]
+            batch.append(src.deepcopy(copy_parent=False))
+            i += 1
+
+        random.shuffle(batch)
+        self._verify_distinct(req, inner, batch)
+        return batch
+
+    def _target_distinct(self, req: PopulationRequirement, n: int) -> tuple[int, str]:
+        """The distinct-value count to construct toward, and the mode:
+
+        - ``"reach"`` (``>=``/``>``/``==``): build *exactly* this many distinct values (must be
+          found, or it is a shortfall). Satisfies the operator since e.g. ``== ceil`` for ``>=``.
+        - ``"cap"`` (``<=``/``<``): use *at most* this many distinct values (fewer is fine).
+        """
+        b = req.bound
+        if b < 0:
+            raise FandangoValueError(
+                f"A `distinct_count` target must be non-negative; got {b}."
+            )
+        op = req.operator
+        if op is Comparison.GREATER_EQUAL:
+            target, mode = math.ceil(b), "reach"
+        elif op is Comparison.GREATER:
+            target, mode = math.floor(b) + 1, "reach"
+        elif op is Comparison.EQUAL:
+            if b != int(b):
+                raise FandangoValueError(
+                    f"'distinct_count == {b}' can never hold: a count is an integer."
+                )
+            target, mode = int(b), "reach"
+        elif op is Comparison.LESS_EQUAL:
+            target, mode = math.floor(b), "cap"
+        elif op is Comparison.LESS:
+            target, mode = math.ceil(b) - 1, "cap"
+        else:  # pragma: no cover - guarded by _CONSTRUCTIBLE_OPERATORS
+            raise NotImplementedError(
+                f"Operator '{op.value}' is not supported for a distinct_count requirement."
+            )
+
+        if mode == "reach" and target > n:
+            raise FandangoValueError(
+                f"Requirement 'distinct_count {op.value} {b}' is infeasible at N={n}: a batch of "
+                f"{n} individuals can hold at most {n} distinct values."
+            )
+        if mode == "cap" and target < 1:
+            raise FandangoValueError(
+                f"Requirement 'distinct_count {op.value} {b}' is infeasible: a non-empty batch "
+                f"always has at least one distinct value."
+            )
+        return target, mode
+
+    def _verify_distinct(
+        self, req: PopulationRequirement, inner: _InnerValue, batch: list[DerivationTree]
+    ) -> None:
+        """Independent gate: the assembled batch's distinct-value count must satisfy the
+        operator. ``distinct_count`` targets are integers (no snapping), so the literal operator
+        check is exact."""
+        values = [self._sole_value(inner, tree) for tree in batch]
+        actual = REDUCERS["distinct_count"](values)
+        if not req.operator.compare(actual, req.bound):
+            raise PopulationShortfallError(
+                f"Verification gate failed for 'distinct_count {req.operator.value} {req.bound}': "
+                f"assembled batch has {actual} distinct values."
             )
