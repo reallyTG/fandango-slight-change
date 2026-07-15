@@ -279,6 +279,58 @@ class TestPopulationSamplerDistribution(unittest.TestCase):
             PopulationSampler(grammar).sample(30)
 
 
+class TestPopulationSamplerCoEnforcement(unittest.TestCase):
+    """A per-tree hard `where` alongside a population requirement: every constructed individual
+    satisfies the per-tree constraint (rejection-fuzzed candidate source), and the population
+    requirement still holds."""
+
+    # A flag whose fraction is constrained at the batch level, and an independent age with a
+    # per-tree lower bound -- so the two constraints don't interact.
+    SPEC = (
+        '<start> ::= <flag> "," <age> "\\n"\n'
+        '<flag> ::= "0" | "1"\n'
+        "<age> ::= r'[0-9][0-9]'\n"
+        "where int(<age>) >= 40\n"
+        "where fraction(int(<flag>) == 1 for x in population) == 0.30\n"
+    )
+
+    def setUp(self):
+        random.seed(0)
+
+    @staticmethod
+    def _parse(spec):
+        with tempfile.NamedTemporaryFile("w", suffix=".fan", delete=False) as f:
+            f.write(spec)
+            path = f.name
+        try:
+            with open(path) as f:
+                return parse(f, use_stdlib=False, use_cache=False)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_sampler_co_enforces_per_tree_constraint(self):
+        grammar, constraints = self._parse(self.SPEC)
+        batch = PopulationSampler(grammar, constraints=constraints).sample(20)
+        self.assertEqual(len(batch), 20)
+        ages = [int(str(t).strip().split(",")[1]) for t in batch]
+        flags = [int(str(t).strip().split(",")[0]) for t in batch]
+        self.assertTrue(all(a >= 40 for a in ages))  # per-tree constraint
+        self.assertEqual(REDUCERS["fraction"]([f == 1 for f in flags]), 0.30)  # population
+
+    def test_unsatisfiable_per_tree_constraint_shortfalls(self):
+        # <age> is two digits (0-99); demanding >= 200 can never be fuzzed.
+        grammar, constraints = self._parse(
+            '<start> ::= <age> "\\n"\n'
+            "<age> ::= r'[0-9][0-9]'\n"
+            "where int(<age>) >= 200\n"
+            "where fraction(int(<age>) >= 50 for x in population) == 0.30\n"
+        )
+        with self.assertRaises(PopulationShortfallError):
+            PopulationSampler(
+                grammar, constraints=constraints, max_attempts_per_slot=50
+            ).sample(10)
+
+
 class TestPopulationSamplerEndToEnd(unittest.TestCase):
     """Through the public `Fandango.fuzz` API: a population `where` routes to the sampler."""
 
@@ -327,11 +379,20 @@ class TestPopulationSamplerEndToEnd(unittest.TestCase):
         ages = [int(str(t).strip()) for t in batch]
         self.assertLessEqual(REDUCERS["normal_fit"](ages, 30, 5), 0.5)
 
-    def test_per_tree_hard_constraint_alongside_requirement_raises(self):
-        spec = self.SPEC + "where int(<income>) >= 0\n"
+    def test_per_tree_constraint_is_co_enforced_via_fuzz(self):
+        # income quota at the batch level + a per-tree lower bound on an independent age field.
+        spec = (
+            '<start> ::= <income> "," <age> "\\n"\n'
+            '<income> ::= "0" | "1"\n'
+            "<age> ::= r'[0-9][0-9]'\n"
+            "where int(<age>) >= 40\n"
+            "where fraction(int(<income>) == 1 for x in population) == 0.30\n"
+        )
         fan = Fandango(spec)
-        with self.assertRaises(NotImplementedError):
-            fan.fuzz(desired_solutions=10)
+        batch = fan.fuzz(desired_solutions=20)
+        self.assertEqual(len(batch), 20)
+        ages = [int(str(t).strip().split(",")[1]) for t in batch]
+        self.assertTrue(all(a >= 40 for a in ages))
 
 
 if __name__ == "__main__":

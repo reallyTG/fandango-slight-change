@@ -5,7 +5,7 @@ guarantee over the whole emitted batch of N -- something no single individual ca
 that streaming, per-tree evolution cannot express. This sampler sits *above* the GA and
 constructs such a batch directly.
 
-v1 covers two exact-by-construction cases, both requiring exactly one inner value per individual:
+v1 covers three construction cases, all requiring exactly one inner value per individual:
 
 - **fraction quota** -- ``fraction(<pred> for x in population) OP p``: buckets fuzzed individuals
   by the boolean predicate and assembles the target count, hitting the fraction exactly (for
@@ -14,11 +14,15 @@ v1 covers two exact-by-construction cases, both requiring exactly one inner valu
   representatives until the required number of *distinct* field values is reached (``>=``/``>``/
   ``==``) or capped (``<=``/``<``), then fills the batch by reusing those representatives so the
   distinct count lands exactly on target.
+- **distributional fit** -- ``normal_fit([<x> for x in population], ...) OP delta`` (``<=``/``<``):
+  fuzzes a candidate pool and selects, for each order-statistic slot, the individual whose value is
+  nearest the target quantile, so the batch's distribution matches the target within delta.
 
-A final verification gate re-checks the assembled batch in both cases. Everything else raises a
-clear error rather than silently degrading: multiple requirements, distributional fits
-(``normal_fit`` &c.), multi-valued inner fields (the grouping-policy case), and per-tree hard
-constraints alongside a requirement are all future work.
+A final verification gate re-checks the assembled batch in every case, and per-tree hard
+constraints from the spec are co-enforced -- every constructed individual is drawn to satisfy them
+(the candidate source rejection-fuzzes). Everything else raises a clear error rather than silently
+degrading: multiple population requirements at once and multi-valued inner fields (the
+grouping-policy case) are future work.
 """
 
 import bisect
@@ -27,6 +31,7 @@ import random
 from statistics import NormalDist
 from typing import Any, Optional
 
+from fandango.constraints.constraint import Constraint
 from fandango.constraints.failing_tree import Comparison
 from fandango.constraints.population import (
     REDUCERS,
@@ -101,6 +106,7 @@ class PopulationSampler:
         grammar: Grammar,
         requirements: Optional[list[PopulationRequirement]] = None,
         *,
+        constraints: Optional[list[Constraint]] = None,
         max_attempts_per_slot: int = 1000,
         distribution_pool_factor: int = 40,
     ) -> None:
@@ -110,6 +116,9 @@ class PopulationSampler:
             if requirements is not None
             else list(getattr(grammar, "population_requirements", []))
         )
+        # Per-tree hard constraints every constructed individual must satisfy (co-enforced by
+        # rejection-fuzzing the candidate source below).
+        self._constraints = list(constraints) if constraints else []
         self._max_attempts_per_slot = max(1, max_attempts_per_slot)
         # How many candidate individuals to fuzz per requested one when matching a target
         # distribution: a larger pool covers the target quantiles more finely (better fit).
@@ -122,7 +131,7 @@ class PopulationSampler:
         if n <= 0:
             raise FandangoValueError(f"Population size must be positive; got {n}.")
         if not self.requirements:
-            return [self.grammar.fuzz() for _ in range(n)]
+            return [self._candidate() for _ in range(n)]
         if len(self.requirements) > 1:
             raise NotImplementedError(
                 f"v1 supports a single population requirement; got {len(self.requirements)}. "
@@ -143,6 +152,24 @@ class PopulationSampler:
         raise NotImplementedError(
             f"v1 constructs `fraction` quotas, `distinct_count` diversity, and distributional "
             f"fits ({', '.join(sorted(_DISTRIBUTION_QUANTILES))}); got '{reducer}'."
+        )
+
+    def _candidate(self) -> DerivationTree:
+        """A freshly fuzzed individual that satisfies every per-tree hard constraint.
+
+        With no constraints this is a plain ``grammar.fuzz()``. Otherwise it rejection-fuzzes:
+        the population sampler bypasses the GA, so per-tree constraints are enforced by drawing
+        until a valid individual appears. A too-tight constraint exhausts the budget -> shortfall."""
+        if not self._constraints:
+            return self.grammar.fuzz()
+        for _ in range(self._max_attempts_per_slot):
+            tree = self.grammar.fuzz()
+            if all(constraint.check(tree) for constraint in self._constraints):
+                return tree
+        raise PopulationShortfallError(
+            f"Could not fuzz an individual satisfying the {len(self._constraints)} per-tree "
+            f"constraint(s) within {self._max_attempts_per_slot} attempts. The constraints may "
+            f"be too tight for plain fuzzing (GA-backed candidate generation is future work)."
         )
 
     def _inner(self, req: PopulationRequirement) -> _InnerValue:
@@ -187,7 +214,7 @@ class PopulationSampler:
                     f"too rare or too common under plain fuzzing."
                 )
             attempts += 1
-            tree = self.grammar.fuzz()
+            tree = self._candidate()
             if self._predicate_value(inner, tree):
                 if len(true_bucket) < target_true:
                     true_bucket.append(tree)
@@ -268,7 +295,7 @@ class PopulationSampler:
 
         # `>= 0` (or `< 1` -> handled as infeasible) imposes nothing; just fuzz a plain batch.
         if target <= 0:
-            batch = [self.grammar.fuzz() for _ in range(n)]
+            batch = [self._candidate() for _ in range(n)]
             self._verify_distinct(req, inner, batch)
             return batch
 
@@ -292,7 +319,7 @@ class PopulationSampler:
                     )
                 break  # "cap": fewer distinct values than the cap is fine (<=/< still holds)
             attempts += 1
-            tree = self.grammar.fuzz()
+            tree = self._candidate()
             value = self._sole_value(inner, tree)
             if value not in reps:
                 reps[value] = tree
@@ -399,7 +426,7 @@ class PopulationSampler:
         attempts = 0
         while len(pool) < target_pool and attempts < cap:
             attempts += 1
-            tree = self.grammar.fuzz()
+            tree = self._candidate()
             value = self._sole_value(inner, tree)
             pool.append((float(value), tree))
         if not pool:
