@@ -1,7 +1,7 @@
 #!/usr/bin/env pytest
 """Mechanism B steps 5-6: the population sampler that *constructs* a batch satisfying a hard
-population `where`. v1 covers the exact-by-construction `fraction` quota (one boolean per
-individual); other shapes raise clear errors."""
+population `where`. v1 covers the `fraction` quota, `distinct_count` diversity, and distributional
+fits (normal_fit &c.); other shapes raise clear errors."""
 
 import random
 import tempfile
@@ -216,6 +216,69 @@ class TestPopulationSamplerDiversity(unittest.TestCase):
             PopulationSampler(grammar).sample(20)
 
 
+AGE_GRAMMAR = '<start> ::= <name> "," <age> "\\n"\n<name> ::= "x" | "y"\n<age> ::= r\'[0-9][0-9]\'\n'
+
+
+def _age_grammar_with(where_line: str, age_body: str = "r'[0-9][0-9]'"):
+    grammar_src = (
+        f'<start> ::= <name> "," <age> "\\n"\n<name> ::= "x" | "y"\n<age> ::= {age_body}\n'
+    )
+    spec = grammar_src + "\n" + where_line + "\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".fan", delete=False) as f:
+        f.write(spec)
+        path = f.name
+    try:
+        with open(path) as f:
+            grammar, _ = parse(f, use_stdlib=False, use_cache=False)
+        return grammar
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
+def _ages(batch):
+    return [int(str(t).strip().split(",")[1]) for t in batch]
+
+
+class TestPopulationSamplerDistribution(unittest.TestCase):
+    """A distributional fit `reducer([<x> for x in population], ...) <= delta` is matched by
+    fuzzing a pool and selecting the individual nearest each target quantile."""
+
+    def setUp(self):
+        random.seed(0)
+
+    def test_normal_fit_matches_within_delta(self):
+        grammar = _age_grammar_with(
+            "where normal_fit([int(<age>) for x in population], 30, 5) <= 0.5"
+        )
+        batch = PopulationSampler(grammar).sample(30)
+        self.assertEqual(len(batch), 30)
+        self.assertLessEqual(REDUCERS["normal_fit"](_ages(batch), 30, 5), 0.5)
+
+    def test_uniform_fit_matches_within_delta(self):
+        grammar = _age_grammar_with(
+            "where uniform_fit([int(<age>) for x in population], 10, 40) <= 0.5"
+        )
+        batch = PopulationSampler(grammar).sample(40)
+        self.assertLessEqual(REDUCERS["uniform_fit"](_ages(batch), 10, 40), 0.5)
+
+    def test_coarse_grammar_shortfalls(self):
+        # Only five possible ages can't approximate Normal(30, 5) to within 0.5.
+        grammar = _age_grammar_with(
+            "where normal_fit([int(<age>) for x in population], 30, 5) <= 0.5",
+            age_body='"18" | "25" | "30" | "35" | "45"',
+        )
+        with self.assertRaises(PopulationShortfallError):
+            PopulationSampler(grammar).sample(30)
+
+    def test_fit_with_lower_bound_operator_is_rejected(self):
+        # A fit is a distance to a target; `>=` ("stay far away") has no construction meaning.
+        grammar = _age_grammar_with(
+            "where normal_fit([int(<age>) for x in population], 30, 5) >= 0.5"
+        )
+        with self.assertRaises(NotImplementedError):
+            PopulationSampler(grammar).sample(30)
+
+
 class TestPopulationSamplerEndToEnd(unittest.TestCase):
     """Through the public `Fandango.fuzz` API: a population `where` routes to the sampler."""
 
@@ -229,6 +292,12 @@ class TestPopulationSamplerEndToEnd(unittest.TestCase):
         '<start> ::= <occ> "\\n"\n'
         '<occ> ::= "eng" | "doc" | "art" | "law" | "edu"\n'
         "where distinct_count(<occ> for x in population) >= 4\n"
+    )
+
+    AGE_SPEC = (
+        '<start> ::= <age> "\\n"\n'
+        "<age> ::= r'[0-9][0-9]'\n"
+        "where normal_fit([int(<age>) for x in population], 30, 5) <= 0.5\n"
     )
 
     def setUp(self):
@@ -250,6 +319,13 @@ class TestPopulationSamplerEndToEnd(unittest.TestCase):
         batch = fan.fuzz(desired_solutions=20)
         self.assertEqual(len(batch), 20)
         self.assertGreaterEqual(_distinct(batch), 4)
+
+    def test_fuzz_constructs_the_distribution_matched_batch(self):
+        fan = Fandango(self.AGE_SPEC)
+        batch = fan.fuzz(desired_solutions=30)
+        self.assertEqual(len(batch), 30)
+        ages = [int(str(t).strip()) for t in batch]
+        self.assertLessEqual(REDUCERS["normal_fit"](ages, 30, 5), 0.5)
 
     def test_per_tree_hard_constraint_alongside_requirement_raises(self):
         spec = self.SPEC + "where int(<income>) >= 0\n"

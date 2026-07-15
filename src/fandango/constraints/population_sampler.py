@@ -21,8 +21,10 @@ clear error rather than silently degrading: multiple requirements, distributiona
 constraints alongside a requirement are all future work.
 """
 
+import bisect
 import math
 import random
+from statistics import NormalDist
 from typing import Any, Optional
 
 from fandango.constraints.failing_tree import Comparison
@@ -49,6 +51,37 @@ _CONSTRUCTIBLE_OPERATORS = frozenset(
 )
 
 
+# Distributional-fit reducers, mapped to a factory that turns their literal target parameters into
+# the target distribution's quantile function Q(p). The fit is the mean gap to these quantiles, so
+# placing the batch's order statistics on Q((i+0.5)/N) drives the fit toward its discretization
+# floor. These mirror the quantiles the fits themselves integrate against in population.py.
+# Plain (unannotated) so beartype's claw hook doesn't try to wrap functions that return a bare
+# callable -- it chokes on `Callable[[float], float]` in return position here.
+def _normal_quantile(mu, sigma):
+    return NormalDist(float(mu), float(sigma)).inv_cdf
+
+
+def _lognormal_quantile(mu, sigma):
+    nd = NormalDist(float(mu), float(sigma))
+    return lambda p: math.exp(nd.inv_cdf(p))
+
+
+def _uniform_quantile(lo, hi):
+    return lambda p: lo + p * (hi - lo)
+
+
+def _exponential_quantile(rate):
+    return lambda p: -math.log1p(-p) / rate
+
+
+_DISTRIBUTION_QUANTILES = {
+    "normal_fit": _normal_quantile,
+    "lognormal_fit": _lognormal_quantile,
+    "uniform_fit": _uniform_quantile,
+    "exponential_fit": _exponential_quantile,
+}
+
+
 class PopulationShortfallError(FandangoValueError):
     """Raised when the sampler cannot assemble a batch meeting a requirement within budget."""
 
@@ -69,6 +102,7 @@ class PopulationSampler:
         requirements: Optional[list[PopulationRequirement]] = None,
         *,
         max_attempts_per_slot: int = 1000,
+        distribution_pool_factor: int = 40,
     ) -> None:
         self.grammar = grammar
         self.requirements = (
@@ -77,6 +111,9 @@ class PopulationSampler:
             else list(getattr(grammar, "population_requirements", []))
         )
         self._max_attempts_per_slot = max(1, max_attempts_per_slot)
+        # How many candidate individuals to fuzz per requested one when matching a target
+        # distribution: a larger pool covers the target quantiles more finely (better fit).
+        self._distribution_pool_factor = max(1, distribution_pool_factor)
         # The environment the inner predicate is eval'd in (so spec-level `def`s/imports work).
         self._global_variables, self._local_variables = grammar.get_spec_env()
 
@@ -101,9 +138,11 @@ class PopulationSampler:
             return self._sample_fraction(req, n)
         if reducer == "distinct_count":
             return self._sample_distinct(req, n)
+        if reducer in _DISTRIBUTION_QUANTILES:
+            return self._sample_distribution(req, n)
         raise NotImplementedError(
-            f"v1 constructs `fraction` quotas and `distinct_count` diversity; got '{reducer}'. "
-            f"Distributional fits (normal_fit, ...) are future work."
+            f"v1 constructs `fraction` quotas, `distinct_count` diversity, and distributional "
+            f"fits ({', '.join(sorted(_DISTRIBUTION_QUANTILES))}); got '{reducer}'."
         )
 
     def _inner(self, req: PopulationRequirement) -> _InnerValue:
@@ -329,4 +368,72 @@ class PopulationSampler:
             raise PopulationShortfallError(
                 f"Verification gate failed for 'distinct_count {req.operator.value} {req.bound}': "
                 f"assembled batch has {actual} distinct values."
+            )
+
+    # -- distributional-shape construction ---------------------------------- #
+    def _sample_distribution(
+        self, req: PopulationRequirement, n: int
+    ) -> list[DerivationTree]:
+        """Match a target distribution: ``normal_fit([<x> for x in population], ...) <= delta``.
+
+        The fit is the mean gap between the sorted batch and the target quantiles Q((k+0.5)/N),
+        so we fuzz a candidate pool, then for each quantile pick the candidate whose value is
+        nearest to it. The batch's order statistics land on the target quantiles as closely as the
+        grammar's own values allow -- driving the fit to its discretization floor -- without
+        assuming anything about how the field is spelled. If the grammar is too coarse to reach
+        ``delta``, the verification gate reports a shortfall rather than a false success.
+        """
+        reducer = req.aggregate.reducer_name
+        if req.operator not in (Comparison.LESS_EQUAL, Comparison.LESS):
+            raise NotImplementedError(
+                f"A distributional fit is a distance to a target; only `<=`/`<` are meaningful "
+                f"(match within delta). Got '{req.operator.value}' for '{reducer}'."
+            )
+        quantile = _DISTRIBUTION_QUANTILES[reducer](*req.aggregate.reducer_args)
+        inner = self._inner(req)
+
+        # Candidate pool of (value, tree). Skip trees that don't yield exactly one numeric value.
+        pool: list[tuple[float, DerivationTree]] = []
+        target_pool = self._distribution_pool_factor * n
+        cap = self._max_attempts_per_slot * n
+        attempts = 0
+        while len(pool) < target_pool and attempts < cap:
+            attempts += 1
+            tree = self.grammar.fuzz()
+            value = self._sole_value(inner, tree)
+            pool.append((float(value), tree))
+        if not pool:
+            raise PopulationShortfallError(
+                f"Could not build a candidate pool for '{reducer} {req.operator.value} "
+                f"{req.bound}' at N={n}."
+            )
+
+        pool.sort(key=lambda vt: vt[0])
+        pool_values = [v for v, _ in pool]
+        batch: list[DerivationTree] = []
+        for i in range(n):
+            q = quantile((i + 0.5) / n)
+            j = bisect.bisect_left(pool_values, q)
+            nearest = min(
+                (k for k in (j - 1, j, j + 1) if 0 <= k < len(pool)),
+                key=lambda k: abs(pool_values[k] - q),
+            )
+            batch.append(pool[nearest][1].deepcopy(copy_parent=False))
+
+        random.shuffle(batch)
+        self._verify_fit(req, inner, batch)
+        return batch
+
+    def _verify_fit(
+        self, req: PopulationRequirement, inner: _InnerValue, batch: list[DerivationTree]
+    ) -> None:
+        """Independent gate: the assembled batch's distributional fit must satisfy the operator.
+        A coarse grammar may be unable to reach ``delta``; that surfaces here as a shortfall."""
+        values = [self._sole_value(inner, tree) for tree in batch]
+        actual = REDUCERS[req.aggregate.reducer_name](values, *req.aggregate.reducer_args)
+        if not req.operator.compare(actual, req.bound):
+            raise PopulationShortfallError(
+                f"Verification gate failed for '{req.aggregate.reducer_name} "
+                f"{req.operator.value} {req.bound}': assembled batch has fit {actual:.4f}. The "
+                f"grammar may be too coarse to match the target distribution that closely."
             )
