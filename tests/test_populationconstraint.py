@@ -1107,3 +1107,47 @@ class TestOnShortfallWiring(unittest.TestCase):
             desired_solutions=30, on_shortfall="best_effort"
         )
         self.assertEqual(len(batch), 30)
+
+
+class TestFuzzEmitsConstructedBatch(unittest.TestCase):
+    """The hard population `where` and return_population paths construct a batch above the GA;
+    they must still run each tree past solution_callback so CLI output (and side effects) fire."""
+
+    def _fandango(self, spec):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".fan", delete=False) as f:
+            f.write(spec)
+            path = f.name
+        with open(path) as f:
+            return Fandango(f, use_stdlib=False, use_cache=False)
+
+    def test_hard_where_invokes_callback_per_tree(self):
+        spec = (
+            '<start> ::= <income> "\\n"\n<income> ::= "0" | "1"\n'
+            "where fraction(int(<income>) == 1 for x in population) == 0.30\n"
+        )
+        seen = []
+        batch = self._fandango(spec).fuzz(
+            desired_solutions=10, solution_callback=lambda t, i: seen.append((i, str(t)))
+        )
+        self.assertEqual(len(batch), 10)
+        # Callback fired once per constructed tree, with contiguous indices.
+        self.assertEqual([i for i, _ in seen], list(range(10)))
+
+    def test_return_population_invokes_callback_per_tree(self):
+        spec = (
+            '<start> ::= <age> "\\n"\n<age> ::= <d><d>\n'
+            '<d> ::= "0"|"1"|"2"|"3"|"4"|"5"|"6"|"7"|"8"|"9"\n'
+            "minimizing abs(mean(int(<age>) for x in population) - 30)\n"
+        )
+        count = []
+        self._fandango(spec).fuzz(
+            return_population=True,
+            max_generations=5,
+            population_size=12,
+            random_seed=1,
+            solution_callback=lambda t, i: count.append(i),
+        )
+        self.assertTrue(count)
+        self.assertEqual(count, list(range(len(count))))

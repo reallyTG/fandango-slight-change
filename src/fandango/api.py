@@ -441,23 +441,25 @@ class Fandango(FandangoBase):
         # per-tree fitness, so it is *constructed* by the population sampler above the GA rather
         # than evolved. When the grammar carries any such requirement, route around the GA.
         if self._grammar.population_requirements:
-            return self._fuzz_population(
+            batch = self._fuzz_population(
                 desired_solutions,
                 extra_constraints=extra_constraints,
                 on_shortfall=on_shortfall,
             )
+            return self._emit(batch, solution_callback)
 
         # Soft population objectives steer the *working set*, which fuzz()'s solution
         # stream does not reflect. Return that working set on request; otherwise warn so
         # the steering is not silently invisible (downstream finding #2).
         if return_population:
-            return self._fuzz_return_population(
+            batch = self._fuzz_return_population(
                 extra_constraints=extra_constraints,
                 desired_solutions=desired_solutions,
                 max_generations=max_generations,
                 mode=mode,
                 **settings,
             )
+            return self._emit(batch, solution_callback)
         if self._has_soft_population_objectives():
             LOGGER.warning(
                 "This spec has a soft population-level objective, but fuzz() returns the "
@@ -499,6 +501,18 @@ class Fandango(FandangoBase):
         solutions.extend(padding)
 
         return solutions
+
+    @staticmethod
+    def _emit(
+        batch: list[DerivationTree],
+        solution_callback: Callable[[DerivationTree, int], None],
+    ) -> list[DerivationTree]:
+        """Run each tree of a *constructed* batch (the population/return-population paths, which
+        do not stream through the GA) past the solution callback, so CLI output and any per-tree
+        side effect fire just as they do on the streaming path. Returns the batch unchanged."""
+        for index, tree in enumerate(batch):
+            solution_callback(tree, index)
+        return batch
 
     def _fuzz_population(
         self,
