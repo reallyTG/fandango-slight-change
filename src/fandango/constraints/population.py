@@ -508,15 +508,16 @@ def _references_population(node: ast.AST) -> bool:
     )
 
 
-def _is_population_reducer_call(node: ast.AST) -> bool:
-    """A call ``reducer(<genexp/listcomp> for x in population, *target_params)``.
+def _is_reducer_shaped_call_over_population(node: ast.AST) -> bool:
+    """A call ``<name>(<genexp/listcomp> for x in population, *params)`` — the *shape*
+    of a reducer call, regardless of whether ``<name>`` is a registered reducer.
 
-    The generator must be the first argument; any further positional arguments are the
-    reducer's literal target parameters (e.g. the mu/sigma of ``normal_fit``)."""
+    Used both by :func:`_is_population_reducer_call` (which additionally requires the
+    name to be registered) and by the error path, which reports a well-formed call to
+    an *unregistered* name as an "unknown reducer" rather than generic misuse."""
     if not (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id in REDUCERS
         and len(node.args) >= 1
         and not node.keywords
         and isinstance(node.args[0], (ast.GeneratorExp, ast.ListComp))
@@ -527,6 +528,20 @@ def _is_population_reducer_call(node: ast.AST) -> bool:
         len(comp.generators) == 1
         and isinstance(comp.generators[0].iter, ast.Name)
         and comp.generators[0].iter.id == POPULATION_BINDER
+    )
+
+
+def _is_population_reducer_call(node: ast.AST) -> bool:
+    """A call ``reducer(<genexp/listcomp> for x in population, *target_params)`` where
+    ``reducer`` is a registered reducer.
+
+    The generator must be the first argument; any further positional arguments are the
+    reducer's literal target parameters (e.g. the mu/sigma of ``normal_fit``)."""
+    return (
+        _is_reducer_shaped_call_over_population(node)
+        and isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in REDUCERS
     )
 
 
@@ -560,6 +575,21 @@ def try_parse_population_aggregate(
 
     reducer_calls = [n for n in ast.walk(root) if _is_population_reducer_call(n)]
     if not reducer_calls:
+        # Distinguish "well-formed call to an unregistered reducer" from genuine misuse.
+        # The former is almost always a call-order problem (register_reducer() /
+        # register_distribution_fit() hasn't run yet), not a syntax error — point at that.
+        unknown = [
+            n.func.id  # type: ignore[union-attr]  # shape guarantees Call+Name
+            for n in ast.walk(root)
+            if _is_reducer_shaped_call_over_population(n)
+        ]
+        if unknown:
+            raise FandangoValueError(
+                f"Unknown reducer {unknown[0]!r} in {expression!r}. Register it with "
+                f"register_reducer() / register_distribution_fit() before parsing this "
+                f"spec (registration is process-wide and must run first). "
+                f"Known reducers: {', '.join(sorted(REDUCERS))}."
+            )
         raise FandangoValueError(
             f"'{POPULATION_BINDER}' may only be used as the iterable of a reducer, "
             f"e.g. mean(<inner> for x in {POPULATION_BINDER}); got {expression!r}. "

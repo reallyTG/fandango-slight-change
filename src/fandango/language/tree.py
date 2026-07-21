@@ -421,6 +421,9 @@ class DerivationTree:
     def __int__(self) -> int:
         return int(self.value())
 
+    def __float__(self) -> float:
+        return float(self.value())
+
     def __bytes__(self) -> bytes:
         return bytes(self.value())
 

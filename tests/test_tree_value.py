@@ -268,7 +268,8 @@ def test_direct_access_simple():
 UNDERLYING_TYPE_NO_ARGS = [
     "__abs__",
     "__ceil__",
-    "__float__",
+    # __float__ is defined explicitly on TreeValue/DerivationTree (not auto-attached),
+    # so it is exercised by test_to_float below rather than the parametrized sweep.
     "__floor__",
     "__index__",
     "__invert__",
@@ -337,6 +338,22 @@ def test_to_underlying_type_no_arg(method):
     assert run > 0, (
         f"{method} not found in dirs of 1, {set(dir(1) + dir('1') + dir(b'1'))}"
     )
+
+
+def test_to_float():
+    # Integer-valued fields, every underlying representation.
+    assert float(TreeValue(1)) == 1.0
+    assert float(TreeValue("1")) == 1.0
+    assert float(TreeValue(b"1")) == 1.0
+    assert float(DerivationTree(Terminal("55"))) == 55.0
+    # Decimal-valued fields must parse as floats, not route through int() and raise.
+    # This is the regression: float(<tree>) used to resolve to int(<tree>).
+    assert float(TreeValue("55.4")) == 55.4
+    assert float(TreeValue(b"55.4")) == 55.4
+    assert float(DerivationTree(Terminal("3.5"))) == 3.5
+    # A non-numeric string still raises a conversion error, not a silent wrong value.
+    with pytest.raises(FandangoConversionError):
+        float(TreeValue("abc"))
 
 
 UNDERLYING_TYPE_INT_ARG = [

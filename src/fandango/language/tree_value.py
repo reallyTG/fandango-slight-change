@@ -286,7 +286,10 @@ DIRECT_ACCESS_METHODS_BASE_TO_UNDERLYING_TYPE = [
     "__and__",
     "__abs__",
     "__ceil__",
-    "__float__",
+    # NB: __float__ is defined explicitly on TreeValue (and DerivationTree) rather
+    # than auto-attached here. The exclusive-base-type heuristic resolves __float__ to
+    # `int` (it lives in dir(1) but not dir("1")/dir(b"1")), which routes float() through
+    # int() and raises/truncates on any decimal-valued field. See to_float().
     "__floor__",
     "__index__",
     "__invert__",
@@ -610,6 +613,41 @@ class TreeValue:
                     f"Invalid value type: {type(self._value)}, {self._trailing_bits}. This should not happen, please report this as a bug"
                 )
 
+    def to_float(
+        self,
+        str_to_bytes_encoding: str = STRING_TO_BYTES_ENCODING,
+        bytes_to_str_encoding: str = BYTES_TO_STRING_ENCODING,
+    ) -> float:
+        """
+        Convert the TreeValue to a float.
+
+        Strings are parsed with float(); bytes are decoded with the given encoding and
+        then parsed with float(). Unlike routing float() through int(), this preserves
+        decimal-valued fields (e.g. a "55.4"-valued tree yields 55.4, not a ValueError).
+
+        :param str_to_bytes_encoding: The encoding to use when converting strings to bytes.
+        :param bytes_to_str_encoding: The encoding to use when converting bytes to strings.
+        :throws FandangoConversionError: If the value cannot be converted to a float.
+        :return: A float.
+        """
+        if self._value is None:  # only trailing bits
+            return float(trailing_bits_to_int(self._trailing_bits))
+        self._reduce_trailing_bits(str_to_bytes_encoding=str_to_bytes_encoding)
+        if isinstance(self._value, str):
+            text = self._value
+        elif isinstance(self._value, bytes):
+            text = self.to_string(bytes_to_str_encoding=bytes_to_str_encoding)
+        else:
+            raise FandangoValueError(
+                f"Invalid value type: {type(self._value)}, {self._trailing_bits}. This should not happen, please report this as a bug"
+            )
+        try:
+            return float(text)
+        except ValueError as e:
+            raise FandangoConversionError(
+                f"float conversion failed, value: {self._value!r}, error: {e}"
+            ) from e
+
     @property
     def trailing_bits(self) -> Optional[tuple[int, ...]]:
         """
@@ -630,6 +668,9 @@ class TreeValue:
 
     def __int__(self) -> int:
         return self.to_int()
+
+    def __float__(self) -> float:
+        return self.to_float()
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, TreeValue):

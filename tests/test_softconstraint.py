@@ -1,9 +1,11 @@
 #!/usr/bin/env pytest
 
 import itertools
+import math
 import unittest
 from collections.abc import Generator
 
+from fandango.errors import FandangoValueError
 from fandango.evolution.algorithm import DefaultAlgorithm, LoggerLevel
 from fandango.language.parse.parse import parse
 
@@ -166,3 +168,70 @@ class TestSoftValue(TestSoft):
         last_age = int(lines[-1].split(",")[1])
         self.assertEqual(last_age, 0, last_age)
         self.assertEqual(code, 0, code)
+
+
+class TestSoftValueEvaluationFailure(TestSoft):
+    """Regression tests for the downstream #1 finding: a failed objective evaluation
+    must never be scored as optimal (it used to append 0, which wins under `minimizing`)."""
+
+    SPEC = (
+        "<start> ::= <x>\n"
+        '<x> ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"\n\n'
+        # honest optimum is x=9 (value 91); raises ZeroDivisionError only at x=0
+        "minimizing (100 - int(<x>)) + 0 * (1 // int(<x>))\n"
+    )
+
+    def _soft(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".fan", delete=False
+        ) as handle:
+            handle.write(self.SPEC)
+            path = handle.name
+        with open(path) as file:
+            grammar, constraints = parse(file, use_stdlib=False, use_cache=False)
+        return grammar, constraints[0]
+
+    def test_valid_trees_scored_honestly(self):
+        grammar, soft = self._soft()
+        for digit in "123456789":
+            value = soft.fitness(grammar.parse(digit)).fitness()
+            self.assertEqual(value, 100 - int(digit))
+
+    def test_failure_substitute_is_goal_aware(self):
+        # Unit: a failed evaluation substitutes the worst value for the optimization
+        # direction, so a crash is never scored *better* than a valid tree.
+        from fandango.constraints.soft import SoftValue
+
+        self.assertEqual(
+            SoftValue("min", "1 / 0")._on_evaluation_failure(ZeroDivisionError()),
+            math.inf,
+        )
+        self.assertEqual(
+            SoftValue("max", "1 / 0")._on_evaluation_failure(ZeroDivisionError()),
+            -math.inf,
+        )
+
+    def test_fully_failing_evaluation_raises_not_zero(self):
+        # x=0 raises for its only combination -> the objective is broken for that input.
+        # It must raise loudly, never return 0.0 (which used to beat every valid tree).
+        # Works in both modes: strict (conftest sets FANDANGO_RAISE_ALL_EXCEPTIONS ->
+        # the original error propagates) and default (the all-failed guard raises).
+        grammar, soft = self._soft()
+        with self.assertRaises(Exception):
+            soft.fitness(grammar.parse("0")).fitness()
+
+    def test_all_failed_raises_fandango_error_in_default_mode(self):
+        # With the strict env var cleared, the shared fitness loop substitutes the
+        # sentinel and then raises FandangoValueError because every evaluation failed.
+        import os
+
+        grammar, soft = self._soft()
+        previous = os.environ.pop("FANDANGO_RAISE_ALL_EXCEPTIONS", None)
+        try:
+            with self.assertRaises(FandangoValueError):
+                soft.fitness(grammar.parse("0")).fitness()
+        finally:
+            if previous is not None:
+                os.environ["FANDANGO_RAISE_ALL_EXCEPTIONS"] = previous

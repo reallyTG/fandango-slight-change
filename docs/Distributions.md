@@ -236,6 +236,24 @@ invariant.
 therefore an approximation of the true output distribution.
 ```
 
+```{admonition} Reproducibility needs `PYTHONHASHSEED`, not just `random_seed`
+:class: warning
+The search reads dictionary and set iteration order, which Python salts per process.
+Setting `random_seed` alone makes a run deterministic *within* one process but **not**
+across runs — the same command with the same `random_seed` can drift (e.g. a baseline
+mean of 46.9 on one run and 53.3 on the next). For byte-identical results, also fix
+`PYTHONHASHSEED` *before* the interpreter starts:
+
+```shell
+$ PYTHONHASHSEED=0 fandango fuzz -f persons.fan --random-seed 1 ...
+```
+
+This matters most when comparing distributions across runs (A/B measuring how hard an
+objective steers). It applies to both soft objectives and the hard `where` sampler, whose
+candidate shuffles likewise depend on the caller having seeded `random` and pinned
+`PYTHONHASHSEED`.
+```
+
 This mechanism generalizes the built-in [diversity](sec:diversity) bonus, which is a
 fixed, population-aware objective baked into the search; population-level objectives let
 you express your own.

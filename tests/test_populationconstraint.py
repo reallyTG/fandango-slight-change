@@ -324,6 +324,20 @@ class TestParsePopulationAggregate(unittest.TestCase):
                 "median(int(ph) for x in population)", {}
             )
 
+    def test_unknown_reducer_message_points_at_registration(self):
+        # A well-formed call to an unregistered reducer is almost always a call-order
+        # problem, not a syntax error. The message must name the reducer and point at
+        # register_reducer/register_distribution_fit, not the generic "may only be used
+        # as the iterable" misuse text (downstream finding #3).
+        with self.assertRaises(FandangoValueError) as ctx:
+            try_parse_population_aggregate(
+                "gamma_fit([int(ph) for x in population], 1.4, 9408.0)", {}
+            )
+        message = str(ctx.exception)
+        self.assertIn("gamma_fit", message)
+        self.assertIn("register", message.lower())
+        self.assertNotIn("may only be used as the iterable", message)
+
     def test_multiple_aggregates_raise(self):
         with self.assertRaises(FandangoValueError):
             try_parse_population_aggregate(

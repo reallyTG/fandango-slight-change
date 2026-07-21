@@ -8,6 +8,7 @@ from tdigest.tdigest import TDigest as BaseTDigest
 from fandango.constraints.base import GeneticBase
 from fandango.constraints.failing_tree import FailingTree
 from fandango.constraints.fitness import ValueFitness
+from fandango.errors import FandangoValueError
 from fandango.language.search import NonTerminalSearch
 from fandango.language.symbols import NonTerminal
 from fandango.language.tree import DerivationTree
@@ -105,6 +106,8 @@ class Value(GeneticBase):
         else:
             trees = []
             values = []
+            failures = 0
+            last_exception: Optional[Exception] = None
             # Iterate over all combinations of the tree and the scope
             for combination in self.combinations(tree, scope):
                 # Update the local variables to initialize the placeholders with the values of the combination
@@ -123,8 +126,26 @@ class Value(GeneticBase):
                     result = eval(self.expression, self.global_variables, local_vars)
                     values.append(result)
                 except Exception as e:
+                    # Do NOT fabricate a neutral score: appending 0 makes a crash the
+                    # best possible value under `minimizing` (see the downstream #1
+                    # report). `_on_evaluation_failure` decides the goal-aware substitute
+                    # (or re-raises for a Value with no optimization direction).
+                    substitute = self._on_evaluation_failure(e)
                     print_exception(e, f"Evaluation failed: {self.expression}")
-                    values.append(0)
+                    last_exception = e
+                    failures += 1
+                    values.append(substitute)
+            # If every single evaluation failed, the objective is broken for this input
+            # (bad expression, missing registration, unconvertible field); a run that
+            # scores nothing is never worth continuing silently.
+            if values and failures == len(values):
+                raise FandangoValueError(
+                    f"Every evaluation ({failures}/{len(values)}) of the objective "
+                    f"{self.expression!r} failed; the objective is broken for this input. "
+                    f"Fix the expression (e.g. guard the failing case) — a failed "
+                    f"evaluation must not be scored. Last error: "
+                    f"{type(last_exception).__name__}: {last_exception}"
+                ) from last_exception
             # Create the fitness object
             fitness = ValueFitness(
                 values, failing_trees=[FailingTree(t, self) for t in trees]
@@ -132,6 +153,17 @@ class Value(GeneticBase):
         # Cache the fitness
         self.cache[tree_hash] = fitness
         return fitness
+
+    def _on_evaluation_failure(self, exception: Exception) -> float:
+        """Decide what a failed objective evaluation contributes.
+
+        A bare ``Value`` has no optimization direction, so there is no safe "worst"
+        score to substitute — a failed evaluation is a spec bug and is propagated.
+        Subclasses that know their direction (see :class:`SoftValue`) override this to
+        return a goal-aware worst-case sentinel so a crash can never be scored *better*
+        than a valid tree.
+        """
+        raise exception
 
     def get_symbols(self) -> Collection[NonTerminalSearch]:
         """
@@ -165,6 +197,13 @@ class SoftValue(Value):
         ), f"Invalid SoftValue optimization goal {type!r}"
         self.optimization_goal = optimization_goal
         self.tdigest = TDigest(optimization_goal)
+
+    def _on_evaluation_failure(self, exception: Exception) -> float:
+        # Substitute the worst possible value for the optimization direction so a crash
+        # is never selected *for*: +inf under `minimizing` (lower is better), -inf under
+        # `maximizing`. If *every* evaluation fails, the shared fitness loop raises, so
+        # this only ever masks a genuinely occasional raise, never a broken objective.
+        return math.inf if self.optimization_goal == "min" else -math.inf
 
     def format_as_spec(self) -> str:
         representation = self.expression
