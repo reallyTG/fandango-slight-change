@@ -284,6 +284,10 @@ class PopulationSampler:
     :param max_attempts_per_slot: fuzzing budget per individual before declaring a shortfall.
     """
 
+    #: Shortfall policies for :meth:`sample`. ``fail_loud`` raises; ``best_effort`` returns the
+    #: closest assembled batch (or a plain valid batch) with a structured warning.
+    _SHORTFALL_POLICIES = frozenset({"fail_loud", "best_effort"})
+
     def __init__(
         self,
         grammar: Grammar,
@@ -292,6 +296,7 @@ class PopulationSampler:
         constraints: Optional[list[Constraint]] = None,
         max_attempts_per_slot: int = 1000,
         distribution_pool_factor: int = 40,
+        on_shortfall: str = "fail_loud",
     ) -> None:
         self.grammar = grammar
         self.requirements = (
@@ -306,24 +311,53 @@ class PopulationSampler:
         # How many candidate individuals to fuzz per requested one when matching a target
         # distribution: a larger pool covers the target quantiles more finely (better fit).
         self._distribution_pool_factor = max(1, distribution_pool_factor)
+        if on_shortfall not in self._SHORTFALL_POLICIES:
+            raise FandangoValueError(
+                f"on_shortfall must be one of {sorted(self._SHORTFALL_POLICIES)}; "
+                f"got {on_shortfall!r}. (relax_to_nearest_feasible is future work.)"
+            )
+        self._on_shortfall = on_shortfall
+        # The closest batch assembled during the current sample(), surfaced by best_effort when a
+        # gate later fails (the construction targets the nearest feasible, so it is the best miss).
+        self._last_batch: Optional[list[DerivationTree]] = None
         # The environment the inner predicate is eval'd in (so spec-level `def`s/imports work).
         self._global_variables, self._local_variables = grammar.get_spec_env()
 
     def sample(self, n: int) -> list[DerivationTree]:
-        """Return a batch of ``n`` individuals satisfying the population requirements."""
+        """Return a batch of ``n`` individuals satisfying the population requirements.
+
+        On an unmet requirement the behavior follows ``on_shortfall``: ``fail_loud`` (default)
+        raises :class:`PopulationShortfallError`; ``best_effort`` logs a structured warning and
+        returns the closest assembled batch (or, if construction could not start, a plain valid
+        batch of size ``n``) so the caller gets output plus an explicit note that the guarantee
+        did not hold."""
         if n <= 0:
             raise FandangoValueError(f"Population size must be positive; got {n}.")
         if not self.requirements:
             return [self._candidate() for _ in range(n)]
         for req in self.requirements:
             self._validate_requirement(req)
-        # A lone single-field requirement materializes whole source individuals directly; a coupled
-        # requirement (or several requirements) needs the graft path, which sets each field into a
-        # shared skeleton.
-        if len(self.requirements) == 1 and not self._is_coupled(self.requirements[0]):
-            return self._sample_single(self.requirements[0], n)
-        self._validate_disjoint()
-        return self._sample_joint(n)
+        self._last_batch = None
+        try:
+            # A lone single-field requirement materializes whole source individuals directly; a
+            # coupled requirement (or several) needs the graft path, which sets each field into a
+            # shared skeleton.
+            if len(self.requirements) == 1 and not self._is_coupled(self.requirements[0]):
+                return self._sample_single(self.requirements[0], n)
+            self._validate_disjoint()
+            return self._sample_joint(n)
+        except PopulationShortfallError as shortfall:
+            if self._on_shortfall != "best_effort":
+                raise
+            LOGGER.warning(
+                f"Population requirement not fully met (on_shortfall=best_effort); returning the "
+                f"closest batch. Shortfall: {shortfall}"
+            )
+            if self._last_batch is not None and len(self._last_batch) == n:
+                return self._last_batch
+            # Construction could not even start (e.g. empty candidate pool); fall back to a plain
+            # valid batch so the caller still gets n individuals satisfying the per-tree rules.
+            return [self._candidate() for _ in range(n)]
 
     @staticmethod
     def _is_coupled(req: PopulationRequirement) -> bool:
@@ -406,6 +440,7 @@ class PopulationSampler:
             next(iter(slot.values())).deepcopy(copy_parent=False)
             for slot in self._plan(req, n)
         ]
+        self._last_batch = batch  # closest miss for best_effort, before the gate can raise
         self._verify_dispatch(req, batch)
         return batch
 
@@ -426,6 +461,7 @@ class PopulationSampler:
         skeletons = [self._candidate() for _ in range(n)]
         columns = {i: self._plan(req, n) for i, req in enumerate(self.requirements)}
         batch = self._graft_all(skeletons, columns)
+        self._last_batch = batch  # closest miss for best_effort, before any gate can raise
         for req in self.requirements:
             self._verify_dispatch(req, batch)
         self._recheck_constraints(batch)

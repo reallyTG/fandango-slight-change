@@ -735,3 +735,35 @@ class TestRegisterRequirement(unittest.TestCase):
 
             for registry in (REDUCERS, REDUCER_TARGET_ARITY, REQUIREMENT_HANDLERS):
                 registry.pop("verify_only_fit", None)
+
+
+class TestPopulationSamplerShortfallPolicy(unittest.TestCase):
+    """P4: the on_shortfall knob. fail_loud (default) raises; best_effort returns the closest
+    assembled batch with a structured warning instead of raising."""
+
+    def setUp(self):
+        random.seed(0)
+
+    def _coarse_normal_grammar(self):
+        # Only five possible ages cannot approximate Normal(30, 5) to within 0.5 -> shortfall.
+        return _age_grammar_with(
+            "where normal_fit([int(<age>) for x in population], 30, 5) <= 0.5",
+            age_body='"18" | "25" | "30" | "35" | "45"',
+        )
+
+    def test_fail_loud_is_default(self):
+        with self.assertRaises(PopulationShortfallError):
+            PopulationSampler(self._coarse_normal_grammar()).sample(30)
+
+    def test_best_effort_returns_closest_batch_with_warning(self):
+        grammar = self._coarse_normal_grammar()
+        sampler = PopulationSampler(grammar, on_shortfall="best_effort")
+        with self.assertLogs("fandango", level="WARNING") as cm:
+            batch = sampler.sample(30)
+        # Returns a full batch (the closest the coarse grammar could assemble), not an exception.
+        self.assertEqual(len(batch), 30)
+        self.assertTrue(any("best_effort" in m for m in cm.output))
+
+    def test_invalid_policy_rejected(self):
+        with self.assertRaises(FandangoValueError):
+            PopulationSampler(_grammar_with(), on_shortfall="relax_to_nearest_feasible")
