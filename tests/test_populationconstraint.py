@@ -1064,3 +1064,46 @@ class TestGroupingPolicy(unittest.TestCase):
         self.assertTrue(seen, "reducer was never called")
         # Every element handed to the reducer is itself a list (one entry's values).
         self.assertTrue(all(isinstance(entry, list) for entry in seen[0]))
+
+
+class TestOnShortfallWiring(unittest.TestCase):
+    """P7: the --on-shortfall CLI flag flows into settings and through fuzz() to the sampler."""
+
+    COARSE = (
+        '<start> ::= <age> "\\n"\n'
+        '<age> ::= "18" | "25" | "30" | "35" | "45"\n'  # 5 values can't match N(30,5) <= 0.5
+        "where normal_fit([int(<age>) for x in population], 30, 5) <= 0.5\n"
+    )
+
+    def _fandango(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".fan", delete=False) as f:
+            f.write(self.COARSE)
+            path = f.name
+        with open(path) as f:
+            return Fandango(f, use_stdlib=False, use_cache=False)
+
+    def test_cli_flag_flows_into_settings(self):
+        from fandango.cli.parser import get_parser
+        from fandango.cli.utils import make_fandango_settings
+
+        parser = get_parser()
+        args = parser.parse_args(
+            ["fuzz", "-f", str(RESOURCES_ROOT / "population_mean.fan"),
+             "--on-shortfall", "best_effort"]
+        )
+        settings = make_fandango_settings(args)
+        self.assertEqual(settings.get("on_shortfall"), "best_effort")
+
+    def test_default_fuzz_raises_on_shortfall(self):
+        from fandango.constraints.population_sampler import PopulationShortfallError
+
+        with self.assertRaises(PopulationShortfallError):
+            self._fandango().fuzz(desired_solutions=30)
+
+    def test_best_effort_fuzz_returns_batch(self):
+        batch = self._fandango().fuzz(
+            desired_solutions=30, on_shortfall="best_effort"
+        )
+        self.assertEqual(len(batch), 30)

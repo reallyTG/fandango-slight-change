@@ -420,6 +420,7 @@ class Fandango(FandangoBase):
         infinite: bool = False,
         mode: FuzzingMode = FuzzingMode.COMPLETE,
         return_population: bool = False,
+        on_shortfall: str = "fail_loud",
         **settings: Any,
     ) -> list[DerivationTree]:
         """
@@ -431,6 +432,8 @@ class Fandango(FandangoBase):
             makes soft population-level objectives observable (the stream is dominated by
             early, barely-steered individuals). Ignored for a hard population `where`,
             which is constructed exactly.
+        :param on_shortfall: For a hard population `where`: "fail_loud" (default, raise with a
+            precise diagnosis) or "best_effort" (warn and return the closest assembled batch).
         :param settings: Additional settings for the evolution algorithm
         :return: A list of derivation trees
         """
@@ -439,7 +442,9 @@ class Fandango(FandangoBase):
         # than evolved. When the grammar carries any such requirement, route around the GA.
         if self._grammar.population_requirements:
             return self._fuzz_population(
-                desired_solutions, extra_constraints=extra_constraints
+                desired_solutions,
+                extra_constraints=extra_constraints,
+                on_shortfall=on_shortfall,
             )
 
         # Soft population objectives steer the *working set*, which fuzz()'s solution
@@ -500,6 +505,7 @@ class Fandango(FandangoBase):
         desired_solutions: Optional[int],
         *,
         extra_constraints: Optional[list[str]] = None,
+        on_shortfall: str = "fail_loud",
     ) -> list[DerivationTree]:
         """Construct a batch satisfying the grammar's hard population requirements (Mechanism
         B), bypassing the GA. The batch size must be fixed; per-tree hard constraints from the
@@ -521,7 +527,7 @@ class Fandango(FandangoBase):
             if isinstance(c, Constraint) and not isinstance(c, SoftValue)
         ]
         return PopulationSampler(
-            self._grammar, constraints=per_tree_hard
+            self._grammar, constraints=per_tree_hard, on_shortfall=on_shortfall
         ).sample(desired_solutions)
 
     def _fuzz_return_population(

@@ -226,6 +226,14 @@ def _get_algorithm_parser() -> argparse.ArgumentParser:
         default=None,
     )
     algorithm_group.add_argument(
+        "--on-shortfall",
+        choices=["fail_loud", "best_effort"],
+        help="For a hard population `where` (constructed by the sampler): what to do when a "
+        "requirement cannot be fully met -- 'fail_loud' (default; raise with a precise "
+        "diagnosis) or 'best_effort' (warn and return the closest assembled batch).",
+        default=None,
+    )
+    algorithm_group.add_argument(
         "--random-seed",
         type=int,
         help="Random seed to use for the algorithm. You probably also want to specify 'PYTHONHASHSEED=<some-value>' to achieve full reproducibility.",
