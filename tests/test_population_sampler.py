@@ -519,12 +519,28 @@ class TestPopulationSamplerCorrelation(unittest.TestCase):
         self.assertGreaterEqual(REDUCERS["correlation"](pairs), 0.5)
         self.assertGreaterEqual(REDUCERS["distinct_count"]([r[2] for r in rows]), 3)
 
-    def test_exact_correlation_rejected(self):
+    def test_exact_correlation_targets_r_within_tolerance(self):
+        # `== r` targets a specific correlation via a Gaussian-copula pairing (exact Pearson
+        # equality is unachievable on discrete values, so the gate is a tolerance band).
+        for target in (0.5, -0.4):
+            random.seed(0)
+            grammar, constraints = _corr_grammar(
+                f"where correlation((int(<age>), int(<income>)) for x in population) "
+                f"== {target}"
+            )
+            batch = PopulationSampler(grammar, constraints=constraints).sample(60)
+            actual = REDUCERS["correlation"](_age_income_pairs(batch))
+            self.assertLessEqual(abs(actual - target), 0.15, f"target {target}, got {actual}")
+
+    def test_exact_correlation_outside_tolerance_shortfalls(self):
+        # A tight tolerance the copula cannot hit on a coarse grammar surfaces as a shortfall.
         grammar, constraints = _corr_grammar(
             "where correlation((int(<age>), int(<income>)) for x in population) == 0.5"
         )
-        with self.assertRaises(NotImplementedError):
-            PopulationSampler(grammar, constraints=constraints).sample(30)
+        with self.assertRaises(PopulationShortfallError):
+            PopulationSampler(
+                grammar, constraints=constraints, correlation_tolerance=0.001
+            ).sample(30)
 
     def test_wrong_symbol_count_rejected(self):
         grammar, constraints = _corr_grammar(

@@ -30,10 +30,14 @@ candidate source rejection-fuzzes; grafted individuals are re-checked). Everythi
 clear error rather than silently degrading: multi-valued inner fields (the grouping-policy case)
 are future work.
 
-Coupled `correlation((<x>, <y>) for x in population) OP r` (`>=`/`>`/`<=`/`<`) is constructed by
-monotone (or anti-monotone) pairing: fuzz a pool, sort each field's values, pair the i-th of each,
-and graft both fields together into a skeleton so the pair holds per individual. Exact `== r`,
-conditional `P(y|x)`, and >2-way coupling are future work.
+Coupled `correlation((<x>, <y>) for x in population) OP r` is constructed by pairing the two
+fields' fuzzed values and grafting both together into a skeleton so the pair holds per individual.
+Inequalities (`>=`/`>`/`<=`/`<`) pair monotonically (or anti-monotonically) to drive toward the
++/-1 extreme; `== r` targets a *specific* correlation via a Gaussian-copula rank pairing, searched
+over many draws for the one whose achieved correlation is nearest `r` (exact Pearson equality is
+unachievable on discrete values, so the gate is a `correlation_tolerance` band -- the analogue of
+the fraction `==` snap-and-warn). Conditional `P(y|x)` (via the umbrella-symbol pattern -- emit the
+whole correlated tuple from one `:=` generator) and >2-way coupling are future work.
 
 Every reducer the sampler can construct is a :class:`_RequirementHandler` in ``_BUILTIN_HANDLERS``;
 validate/plan/verify all dispatch through ``_handler_for``. A downstream package can add a custom
@@ -149,7 +153,13 @@ class _RequirementHandler:
 # up the same way through `_handler_for`.
 _FIT_OPERATORS = frozenset({Comparison.LESS_EQUAL, Comparison.LESS})
 _CORRELATION_OPERATORS = frozenset(
-    {Comparison.GREATER_EQUAL, Comparison.GREATER, Comparison.LESS_EQUAL, Comparison.LESS}
+    {
+        Comparison.EQUAL,
+        Comparison.GREATER_EQUAL,
+        Comparison.GREATER,
+        Comparison.LESS_EQUAL,
+        Comparison.LESS,
+    }
 )
 
 _BUILTIN_HANDLERS: dict[str, _RequirementHandler] = {
@@ -171,10 +181,7 @@ _BUILTIN_HANDLERS: dict[str, _RequirementHandler] = {
         allowed_operators=_CORRELATION_OPERATORS,
         arity=2,
         coupled=True,
-        operator_hint=(
-            "constructing toward an exact correlation is future work; "
-            "use `>=`/`>`/`<=`/`<`"
-        ),
+        operator_hint="correlation supports `==` (approximate) and `>=`/`>`/`<=`/`<`",
     ),
     **{
         name: _RequirementHandler(
@@ -298,6 +305,7 @@ class PopulationSampler:
         max_attempts_per_slot: int = 1000,
         distribution_pool_factor: int = 40,
         on_shortfall: str = "fail_loud",
+        correlation_tolerance: float = 0.15,
     ) -> None:
         self.grammar = grammar
         self.requirements = (
@@ -318,6 +326,10 @@ class PopulationSampler:
                 f"got {on_shortfall!r}. (relax_to_nearest_feasible is future work.)"
             )
         self._on_shortfall = on_shortfall
+        # Exact `correlation == r` is essentially never achievable on discrete grammar values, so
+        # the gate accepts within this tolerance (the correlation analogue of the fraction `==`
+        # snap-and-warn). Inequalities ignore it.
+        self._correlation_tolerance = abs(correlation_tolerance)
         # The closest batch assembled during the current sample(), surfaced by best_effort when a
         # gate later fails (the construction targets the nearest feasible, so it is the best miss).
         self._last_batch: Optional[list[DerivationTree]] = None
@@ -930,7 +942,6 @@ class PopulationSampler:
         """
         sym_x, sym_y = _coupled_field_symbols(req)  # tuple-position order (NOT sorted)
         inner = self._inner(req)
-        ascending = req.operator in (Comparison.GREATER, Comparison.GREATER_EQUAL)
 
         # Pool = N. Oversampling doesn't help: reachability is bounded by marginal variance/ties,
         # which more candidates can't change (unlike the quantile-coverage distribution pool).
@@ -940,24 +951,100 @@ class PopulationSampler:
             x, y = self._sole_value(inner, tree)  # one (x, y) pair, tuple order
             pool.append((float(x), float(y), tree))
 
-        x_cands = sorted(((x, t) for x, _, t in pool), key=lambda z: z[0])
-        y_cands = sorted(
-            ((y, t) for _, y, t in pool), key=lambda z: z[0], reverse=not ascending
-        )
+        xs = sorted(pool, key=lambda z: z[0])  # (x, y, tree) by x ascending
+        ys = sorted(pool, key=lambda z: z[1])  # by y ascending
+        x_vals, x_trees = [p[0] for p in xs], [p[2] for p in xs]
+        y_vals, y_trees = [p[1] for p in ys], [p[2] for p in ys]
+
+        # `== r` targets a *specific* correlation; the inequalities just drive to the extreme
+        # (monotone for >=/>, anti-monotone for <=/<) that satisfies them.
+        if req.operator is Comparison.EQUAL:
+            rank_x, rank_y = self._search_copula_ranks(
+                n, float(req.bound), x_vals, y_vals
+            )
+        else:
+            ascending = req.operator in (Comparison.GREATER, Comparison.GREATER_EQUAL)
+            rank_x = list(range(n))
+            rank_y = list(range(n)) if ascending else list(range(n - 1, -1, -1))
+
         slots = [
-            {sym_x: x_cands[i][1], sym_y: y_cands[i][1]} for i in range(n)
+            {sym_x: x_trees[rank_x[i]], sym_y: y_trees[rank_y[i]]} for i in range(n)
         ]
         random.shuffle(slots)  # shuffle whole maps -- pairing is preserved within each
         return slots
+
+    def _search_copula_ranks(
+        self, n: int, r: float, x_vals: list[float], y_vals: list[float]
+    ) -> tuple[list[int], list[int]]:
+        """Pick the copula rank pairing whose *achieved* correlation is closest to ``r``.
+
+        A single Gaussian-copula draw approximates ``r`` but with ~0.1 sampling noise on discrete
+        marginals, which is too coarse for ``== r``. Drawing many candidate rankings and keeping
+        the one whose actual (x, y) Pearson correlation is nearest ``r`` tightens this to the
+        grammar's achievable resolution -- cheap, since scoring a ranking is O(n) and needs no new
+        fuzzing. Stops early once a draw lands within the tolerance."""
+        attempts = max(1, self._distribution_pool_factor) * 5  # e.g. 200 draws by default
+        best_ranks: Optional[tuple[list[int], list[int]]] = None
+        best_error = float("inf")
+        for _ in range(attempts):
+            rx, ry = self._copula_ranks(n, r)
+            achieved = REDUCERS["correlation"](
+                [(x_vals[rx[i]], y_vals[ry[i]]) for i in range(n)]
+            )
+            error = abs(achieved - r)
+            if error < best_error:
+                best_error, best_ranks = error, (rx, ry)
+                if error <= self._correlation_tolerance:
+                    break
+        assert best_ranks is not None
+        return best_ranks
+
+    @staticmethod
+    def _copula_ranks(n: int, r: float) -> tuple[list[int], list[int]]:
+        """Rank assignments that pair x-rank with y-rank at approximately correlation ``r``.
+
+        Draw ``n`` latent pairs from a bivariate normal with correlation ``r`` (``ly = r*z1 +
+        sqrt(1-r^2)*z2``); slot ``i`` then takes the x-value at ``rank_x[i]`` and the y-value at
+        ``rank_y[i]``, where the ranks are the latent pair's ranks. Pairing the sorted marginals
+        by these correlated ranks reproduces ``r`` in the batch (a Gaussian copula), which is what
+        lets construction hit an arbitrary target rather than only the +/-1 extremes.
+        """
+        r = max(-0.999, min(0.999, r))
+        c = math.sqrt(1.0 - r * r)
+        latents = []
+        for i in range(n):
+            z1 = random.gauss(0.0, 1.0)
+            z2 = random.gauss(0.0, 1.0)
+            latents.append((z1, r * z1 + c * z2, i))
+        rank_x = [0] * n
+        rank_y = [0] * n
+        for rank, (_, _, idx) in enumerate(sorted(latents, key=lambda l: l[0])):
+            rank_x[idx] = rank
+        for rank, (_, _, idx) in enumerate(sorted(latents, key=lambda l: l[1])):
+            rank_y[idx] = rank
+        return rank_x, rank_y
 
     def _verify_correlation(
         self, req: PopulationRequirement, inner: _InnerValue, batch: list[DerivationTree]
     ) -> None:
         """Independent gate: the assembled batch's (x, y) correlation must satisfy the operator.
         ``_correlation`` returns 0.0 for a constant column, so an unreachable bound (e.g. a field
-        with no variance) surfaces here as a shortfall rather than a false success."""
+        with no variance) surfaces here as a shortfall rather than a false success.
+
+        For ``== r`` the gate is a tolerance band (``|actual - r| <= correlation_tolerance``):
+        exact Pearson equality is essentially never achievable on discrete values, so this is the
+        correlation analogue of the fraction ``==`` snap-and-warn."""
         pairs = [self._sole_value(inner, tree) for tree in batch]
         actual = REDUCERS["correlation"](pairs)
+        if req.operator is Comparison.EQUAL:
+            if abs(actual - float(req.bound)) > self._correlation_tolerance:
+                raise PopulationShortfallError(
+                    f"Verification gate failed for 'correlation == {req.bound}': assembled batch "
+                    f"has correlation {actual:.4f}, outside the +/-{self._correlation_tolerance} "
+                    f"tolerance. The marginals may be too coarse (low variance or ties) to reach "
+                    f"that correlation."
+                )
+            return
         if not req.operator.compare(actual, req.bound):
             raise PopulationShortfallError(
                 f"Verification gate failed for 'correlation {req.operator.value} {req.bound}': "
