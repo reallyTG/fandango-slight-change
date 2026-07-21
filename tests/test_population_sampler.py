@@ -653,3 +653,85 @@ class TestPopulationSamplerEndToEnd(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRegisterRequirement(unittest.TestCase):
+    """P3: a custom paired handler registered via register_requirement can be *constructed*
+    toward by the sampler (sample) and verified (check), not just used as a soft reducer."""
+
+    def setUp(self):
+        random.seed(0)
+        # Register a custom "banded uniform" requirement: values drawn evenly across [lo, hi],
+        # checked by the Wasserstein distance to a continuous Uniform(lo, hi). This mirrors the
+        # built-in uniform_fit but proves the whole extension path (register -> parse -> sample).
+        from fandango.constraints.population import register_requirement, wasserstein_fit
+
+        register_requirement(
+            "banded_uniform",
+            check=lambda values, lo, hi: wasserstein_fit(
+                values, lambda p: lo + p * (hi - lo)
+            ),
+            sample=lambda n, lo, hi: [lo + (i + 0.5) / n * (hi - lo) for i in range(n)],
+            allowed_operators=frozenset({"<=", "<"}),
+            target_arity=2,
+        )
+
+    def tearDown(self):
+        # Keep the process-wide registries clean for other tests.
+        from fandango.constraints.population import (
+            REDUCERS,
+            REDUCER_MARGINALS,
+            REDUCER_TARGET_ARITY,
+            REQUIREMENT_HANDLERS,
+        )
+
+        for registry in (
+            REDUCERS,
+            REDUCER_TARGET_ARITY,
+            REDUCER_MARGINALS,
+            REQUIREMENT_HANDLERS,
+        ):
+            registry.pop("banded_uniform", None)
+
+    def test_custom_requirement_is_constructed_and_verified(self):
+        grammar = _age_grammar_with(
+            "where banded_uniform([int(<age>) for x in population], 10, 40) <= 0.5"
+        )
+        batch = PopulationSampler(grammar).sample(40)
+        self.assertEqual(len(batch), 40)
+        from fandango.constraints.population import REDUCERS
+
+        # The custom check gates the batch, exactly like a built-in fit.
+        self.assertLessEqual(REDUCERS["banded_uniform"](_ages(batch), 10, 40), 0.5)
+
+    def test_custom_requirement_disallowed_operator_rejected(self):
+        grammar = _age_grammar_with(
+            "where banded_uniform([int(<age>) for x in population], 10, 40) >= 0.5"
+        )
+        with self.assertRaises(NotImplementedError):
+            PopulationSampler(grammar).sample(40)
+
+    def test_verify_only_handler_is_not_constructible(self):
+        # A handler without `sample` is verify-only (soft use); the sampler cannot construct it.
+        from fandango.constraints.population import register_requirement
+
+        register_requirement(
+            "verify_only_fit",
+            check=lambda values, target: abs(sum(values) / max(1, len(values)) - target),
+            target_arity=1,
+        )
+        try:
+            grammar = _age_grammar_with(
+                "where verify_only_fit([int(<age>) for x in population], 30) <= 1.0"
+            )
+            with self.assertRaises(NotImplementedError):
+                PopulationSampler(grammar).sample(20)
+        finally:
+            from fandango.constraints.population import (
+                REDUCERS,
+                REDUCER_TARGET_ARITY,
+                REQUIREMENT_HANDLERS,
+            )
+
+            for registry in (REDUCERS, REDUCER_TARGET_ARITY, REQUIREMENT_HANDLERS):
+                registry.pop("verify_only_fit", None)

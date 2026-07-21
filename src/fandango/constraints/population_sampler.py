@@ -34,6 +34,12 @@ Coupled `correlation((<x>, <y>) for x in population) OP r` (`>=`/`>`/`<=`/`<`) i
 monotone (or anti-monotone) pairing: fuzz a pool, sort each field's values, pair the i-th of each,
 and graft both fields together into a skeleton so the pair holds per individual. Exact `== r`,
 conditional `P(y|x)`, and >2-way coupling are future work.
+
+Every reducer the sampler can construct is a :class:`_RequirementHandler` in ``_BUILTIN_HANDLERS``;
+validate/plan/verify all dispatch through ``_handler_for``. A downstream package can add a custom
+single-field requirement with :func:`fandango.constraints.population.register_requirement` (a
+paired ``check`` + ``sample`` handler), which the sampler adapts and constructs toward by pinning a
+column to the handler's drawn values.
 """
 
 import ast
@@ -49,7 +55,9 @@ from fandango.constraints.constraint import Constraint
 from fandango.constraints.failing_tree import Comparison
 from fandango.constraints.population import (
     REDUCERS,
+    REQUIREMENT_HANDLERS,
     PopulationRequirement,
+    RequirementHandler,
     _InnerValue,
 )
 from fandango.errors import FandangoValueError
@@ -183,10 +191,38 @@ _BUILTIN_HANDLERS: dict[str, _RequirementHandler] = {
 }
 
 
+def _adapt_custom_handler(reducer: str, custom: RequirementHandler) -> _RequirementHandler:
+    """Wrap a user :class:`RequirementHandler` (value-level ``sample``/``check``) as a sampler
+    ``_RequirementHandler`` whose construct pins a column to the drawn values and whose verify
+    runs ``check`` (see :meth:`PopulationSampler._sample_value_plan` / ``_verify_custom``)."""
+    if custom.allowed_operators is None:
+        allowed = _CONSTRUCTIBLE_OPERATORS
+    else:
+        allowed = frozenset(
+            op for op in _CONSTRUCTIBLE_OPERATORS if op.value in custom.allowed_operators
+        )
+    return _RequirementHandler(
+        construct=lambda s, req, n: s._sample_value_plan(req, n),
+        verify=lambda s, req, inner, batch: s._verify_custom(req, inner, batch),
+        allowed_operators=allowed,
+        arity=1,
+        coupled=False,
+        operator_hint=(
+            f"'{reducer}' allows {sorted(op.value for op in allowed)}"
+        ),
+        grouping=custom.grouping,
+    )
+
+
 def _handler_for(reducer: str) -> Optional[_RequirementHandler]:
     """The handler for ``reducer`` (built-in or custom-registered), or ``None`` if the sampler
-    cannot construct it."""
-    return _BUILTIN_HANDLERS.get(reducer)
+    cannot construct it. A custom handler is constructible only when it supplies a ``sample``."""
+    if reducer in _BUILTIN_HANDLERS:
+        return _BUILTIN_HANDLERS[reducer]
+    custom = REQUIREMENT_HANDLERS.get(reducer)
+    if custom is not None and custom.sample is not None:
+        return _adapt_custom_handler(reducer, custom)
+    return None
 
 
 def _requirement_symbols(req: PopulationRequirement) -> list[str]:
@@ -702,21 +738,19 @@ class PopulationSampler:
             )
 
     # -- distributional shape: select the pool tree nearest each quantile --- #
-    def _distribution_plan(
-        self, req: PopulationRequirement, n: int
+    def _select_by_targets(
+        self,
+        req: PopulationRequirement,
+        targets: list[float],
     ) -> list[DerivationTree]:
-        """Match a target distribution: ``normal_fit([<x> for x in population], ...) <= delta``.
-
-        The fit is the mean gap between the sorted batch and the target quantiles Q((k+0.5)/N),
-        so we fuzz a candidate pool, then for each quantile pick the candidate whose value is
-        nearest to it. The batch's order statistics land on the target quantiles as closely as the
-        grammar's own values allow -- driving the fit to its discretization floor -- without
-        assuming anything about how the field is spelled. If the grammar is too coarse to reach
-        ``delta``, the verification gate reports a shortfall rather than a false success.
+        """Pin a column to a list of ``targets``: fuzz a candidate pool, then for each target
+        value pick the individual whose (sole) field value is nearest it. Shared by the built-in
+        distributional fit (targets = the target quantiles) and custom ``sample`` handlers
+        (targets = the handler's drawn values). The column's order statistics land on the targets
+        as closely as the grammar's own values allow, without assuming how the field is spelled.
         """
-        reducer = req.aggregate.reducer_name
-        quantile = _DISTRIBUTION_QUANTILES[reducer](*req.aggregate.reducer_args)
         inner = self._inner(req)
+        n = len(targets)
 
         # Candidate pool of (value, tree). Skip trees that don't yield exactly one numeric value.
         pool: list[tuple[float, DerivationTree]] = []
@@ -730,24 +764,79 @@ class PopulationSampler:
             pool.append((float(value), tree))
         if not pool:
             raise PopulationShortfallError(
-                f"Could not build a candidate pool for '{reducer} {req.operator.value} "
-                f"{req.bound}' at N={n}."
+                f"Could not build a candidate pool for '{req.aggregate.reducer_name} "
+                f"{req.operator.value} {req.bound}' at N={n}."
             )
 
         pool.sort(key=lambda vt: vt[0])
         pool_values = [v for v, _ in pool]
         column: list[DerivationTree] = []
-        for i in range(n):
-            q = quantile((i + 0.5) / n)
-            j = bisect.bisect_left(pool_values, q)
+        for t in targets:
+            j = bisect.bisect_left(pool_values, t)
             nearest = min(
                 (k for k in (j - 1, j, j + 1) if 0 <= k < len(pool)),
-                key=lambda k: abs(pool_values[k] - q),
+                key=lambda k: abs(pool_values[k] - t),
             )
             column.append(pool[nearest][1])
 
         random.shuffle(column)
         return column
+
+    def _distribution_plan(
+        self, req: PopulationRequirement, n: int
+    ) -> list[DerivationTree]:
+        """Match a target distribution: ``normal_fit([<x> for x in population], ...) <= delta``.
+
+        The fit is the mean gap between the sorted batch and the target quantiles Q((k+0.5)/N),
+        so we select the pool candidate nearest each quantile (see :meth:`_select_by_targets`).
+        The batch's order statistics land on the target quantiles as closely as the grammar's own
+        values allow -- driving the fit to its discretization floor. If the grammar is too coarse
+        to reach ``delta``, the verification gate reports a shortfall rather than a false success.
+        """
+        quantile = _DISTRIBUTION_QUANTILES[req.aggregate.reducer_name](
+            *req.aggregate.reducer_args
+        )
+        return self._select_by_targets(req, [quantile((i + 0.5) / n) for i in range(n)])
+
+    # -- custom registered handler: pin a column to the handler's drawn values -- #
+    def _sample_value_plan(
+        self, req: PopulationRequirement, n: int
+    ) -> list[DerivationTree]:
+        """Construct toward a custom ``register_requirement`` handler: draw ``n`` target values
+        from the handler's ``sample`` and pin a column nearest them (a marginal construction)."""
+        handler = REQUIREMENT_HANDLERS[req.aggregate.reducer_name]
+        assert handler.sample is not None  # only sample-bearing handlers reach here
+        targets = handler.sample(n, *req.aggregate.reducer_args)
+        if len(targets) != n:
+            raise PopulationShortfallError(
+                f"Custom sampler for '{req.aggregate.reducer_name}' returned {len(targets)} "
+                f"values, expected {n}."
+            )
+        return self._select_by_targets(req, [float(t) for t in targets])
+
+    def _verify_custom(
+        self, req: PopulationRequirement, inner: _InnerValue, batch: list[DerivationTree]
+    ) -> None:
+        """Verify a custom requirement: the handler's ``check`` aggregate must satisfy the
+        operator, with the handler's optional ``floor`` giving a precise "unsatisfiable in
+        principle" diagnosis (mirroring the built-in fit gate)."""
+        handler = REQUIREMENT_HANDLERS[req.aggregate.reducer_name]
+        values = [self._sole_value(inner, tree) for tree in batch]
+        params = req.aggregate.reducer_args
+        actual = handler.check(values, *params)
+        if handler.floor is not None:
+            floor = float(handler.floor(values, *params))
+            if float(req.bound) < floor:
+                raise PopulationShortfallError(
+                    f"Requirement '{req.aggregate.reducer_name} {req.operator.value} {req.bound}' "
+                    f"is unsatisfiable in principle: bound {req.bound} is below the handler's "
+                    f"floor ~{floor:.4f} for this field."
+                )
+        if not req.operator.compare(actual, req.bound):
+            raise PopulationShortfallError(
+                f"Verification gate failed for '{req.aggregate.reducer_name} "
+                f"{req.operator.value} {req.bound}': assembled batch has {actual:.4f}."
+            )
 
     def _verify_fit(
         self, req: PopulationRequirement, inner: _InnerValue, batch: list[DerivationTree]

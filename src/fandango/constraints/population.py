@@ -178,6 +178,41 @@ REDUCER_TARGET_ARITY: dict[str, int] = {
 }
 
 
+@dataclass(frozen=True)
+class RequirementHandler:
+    """A custom hard population-requirement handler registered via :func:`register_requirement`.
+
+    Bundles the pieces the sampler (Mechanism B) needs to *construct* and *verify* a batch
+    against a user-defined reducer, beyond the verify-only ``register_reducer``:
+
+    * ``check`` -- the reducer itself, ``check(values, *params) -> float``: the batch-level
+      aggregate compared against the requirement's bound by its operator. Also usable as a soft
+      objective (it is registered into :data:`REDUCERS`).
+    * ``sample`` -- optional constructor, ``sample(n, *params) -> list[value]``: n target values
+      the sampler pins a column to (by fuzzing a pool and selecting the individual whose field
+      value is nearest each target). Absent -> the reducer is verify-only (soft use only; the
+      sampler cannot construct toward it).
+    * ``floor`` -- optional discretization floor, ``floor(values, *params) -> float``: the
+      smallest achievable ``check`` value, below which a bound is unsatisfiable in principle.
+    * ``grouping`` -- multiplicity policy for multi-valued fields (``"pool"`` in v1).
+    * ``allowed_operators`` -- operator names (e.g. ``{"<=", "<"}``) the requirement may use;
+      ``None`` means every constructible operator.
+    """
+
+    check: Callable[..., float]
+    sample: Optional[Callable[..., list[Any]]] = None
+    floor: Optional[Callable[..., float]] = None
+    grouping: str = "pool"
+    target_arity: int = 0
+    allowed_operators: Optional[frozenset[str]] = None
+
+
+# Custom requirement handlers (name -> RequirementHandler), populated by register_requirement.
+# The sampler consults this alongside its built-in handlers; the soft/parse path uses REDUCERS,
+# into which register_requirement also installs the handler's `check`.
+REQUIREMENT_HANDLERS: dict[str, RequirementHandler] = {}
+
+
 # --------------------------------------------------------------------------- #
 # Marginal companions
 # --------------------------------------------------------------------------- #
@@ -398,6 +433,59 @@ def register_distribution_fit(
         marginal=lambda values, *params: wasserstein_marginal(
             values, quantile_factory(*params)
         ),
+    )
+
+
+def register_requirement(
+    name: str,
+    *,
+    check: Callable[..., float],
+    sample: Optional[Callable[..., list[Any]]] = None,
+    floor: Optional[Callable[..., float]] = None,
+    grouping: str = "pool",
+    target_arity: int = 0,
+    allowed_operators: Optional[frozenset[str]] = None,
+    marginal: Optional[Callable[..., list[float]]] = None,
+) -> None:
+    """Register a custom hard population requirement the sampler can *construct* toward.
+
+    This is the paired-handler extension point for Mechanism B: where
+    :func:`register_reducer` adds a verify-only reducer (usable as a soft objective or a
+    hard `where` gate), ``register_requirement`` additionally supplies a ``sample``
+    constructor so the sampler can *build* a batch that satisfies the requirement by
+    construction, plus an optional discretization ``floor``.
+
+    ``check`` is installed into :data:`REDUCERS` (so specs parse and the soft path works)
+    and used as the batch-level verification gate. ``sample(n, *params)`` returns ``n``
+    target values; the sampler pins a column to them by fuzzing a candidate pool and
+    selecting, per target, the individual whose field value is nearest -- a marginal
+    construction (one column pinned toward a target), so it inherits the same benign
+    re-draw behavior as a built-in fit. Without ``sample`` the reducer is verify-only::
+
+        from fandango.constraints.population import register_requirement
+
+        # A field whose values should be drawn Uniform(lo, hi) by construction.
+        register_requirement(
+            "uniform_draw",
+            check=lambda values, lo, hi: uniform_fit_distance(values, lo, hi),
+            sample=lambda n, lo, hi: [lo + (i + 0.5) / n * (hi - lo) for i in range(n)],
+            allowed_operators=frozenset({"<=", "<"}),
+            target_arity=2,
+        )
+        # then, in a .fan spec parsed *after* this call:
+        #   where uniform_draw([int(<age>) for x in population], 10, 40) <= 0.5
+
+    Like all registration, this mutates process-wide state and must run **before** the
+    spec that references ``name`` is parsed.
+    """
+    register_reducer(name, check, target_arity=target_arity, marginal=marginal)
+    REQUIREMENT_HANDLERS[name] = RequirementHandler(
+        check=check,
+        sample=sample,
+        floor=floor,
+        grouping=grouping,
+        target_arity=target_arity,
+        allowed_operators=allowed_operators,
     )
 
 
