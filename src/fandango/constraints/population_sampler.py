@@ -40,6 +40,8 @@ import ast
 import bisect
 import math
 import random
+from collections.abc import Callable
+from dataclasses import dataclass
 from statistics import NormalDist
 from typing import Any, Optional
 
@@ -98,6 +100,93 @@ _DISTRIBUTION_QUANTILES = {
     "uniform_fit": _uniform_quantile,
     "exponential_fit": _exponential_quantile,
 }
+
+
+@dataclass(frozen=True)
+class _RequirementHandler:
+    """How the sampler constructs and verifies one reducer's requirement.
+
+    Collapses what used to be three parallel ``if reducer == ...`` ladders (validate, plan,
+    verify) into a single registry entry. ``construct`` and ``verify`` take the sampler
+    explicitly (they call its private helpers) so the registry can live at module scope; the
+    lambdas resolve the bound methods lazily at call time.
+
+    :param construct: ``(sampler, req, n)`` -> the per-slot source column. Single-field
+        reducers return a ``list[DerivationTree]`` (whole carriers); a coupled reducer returns
+        a ``list[dict[symbol, carrier]]`` directly.
+    :param verify: ``(sampler, req, inner, batch)`` -> None; raises on a failed gate.
+    :param allowed_operators: operators this reducer can be constructed toward (a subset of
+        ``_CONSTRUCTIBLE_OPERATORS``).
+    :param arity: number of grammar fields the inner element reads (1 marginal, 2 coupled).
+    :param coupled: whether the reducer jointly constrains several fields of one individual.
+    :param operator_hint: appended to the error when an operator is not allowed.
+    :param quantile_factory: for distributional fits, ``(*params) -> Q(p)``; else ``None``.
+    :param grouping: multiplicity policy for multi-valued fields (P5); ``"pool"`` for built-ins.
+    """
+
+    construct: Callable[..., list]
+    verify: Callable[..., None]
+    allowed_operators: frozenset
+    arity: int = 1
+    coupled: bool = False
+    operator_hint: str = ""
+    quantile_factory: Optional[Callable[..., Callable[[float], float]]] = None
+    grouping: str = "pool"
+
+
+# Built-in requirement handlers, keyed by reducer name. Defined here (lambdas resolve the
+# sampler's methods lazily) so validate/plan/verify all dispatch through one table. A custom
+# handler registered via register_requirement (see population.register_requirement) is looked
+# up the same way through `_handler_for`.
+_FIT_OPERATORS = frozenset({Comparison.LESS_EQUAL, Comparison.LESS})
+_CORRELATION_OPERATORS = frozenset(
+    {Comparison.GREATER_EQUAL, Comparison.GREATER, Comparison.LESS_EQUAL, Comparison.LESS}
+)
+
+_BUILTIN_HANDLERS: dict[str, _RequirementHandler] = {
+    "fraction": _RequirementHandler(
+        construct=lambda s, req, n: s._fraction_plan(req, n),
+        verify=lambda s, req, inner, batch: s._verify(
+            req, inner, batch, s._target_count(req, len(batch))
+        ),
+        allowed_operators=_CONSTRUCTIBLE_OPERATORS,
+    ),
+    "distinct_count": _RequirementHandler(
+        construct=lambda s, req, n: s._distinct_plan(req, n),
+        verify=lambda s, req, inner, batch: s._verify_distinct(req, inner, batch),
+        allowed_operators=_CONSTRUCTIBLE_OPERATORS,
+    ),
+    "correlation": _RequirementHandler(
+        construct=lambda s, req, n: s._correlation_plan(req, n),
+        verify=lambda s, req, inner, batch: s._verify_correlation(req, inner, batch),
+        allowed_operators=_CORRELATION_OPERATORS,
+        arity=2,
+        coupled=True,
+        operator_hint=(
+            "constructing toward an exact correlation is future work; "
+            "use `>=`/`>`/`<=`/`<`"
+        ),
+    ),
+    **{
+        name: _RequirementHandler(
+            construct=lambda s, req, n: s._distribution_plan(req, n),
+            verify=lambda s, req, inner, batch: s._verify_fit(req, inner, batch),
+            allowed_operators=_FIT_OPERATORS,
+            operator_hint=(
+                "a distributional fit is a distance to a target; only `<=`/`<` are "
+                "meaningful (match within delta)"
+            ),
+            quantile_factory=factory,
+        )
+        for name, factory in _DISTRIBUTION_QUANTILES.items()
+    },
+}
+
+
+def _handler_for(reducer: str) -> Optional[_RequirementHandler]:
+    """The handler for ``reducer`` (built-in or custom-registered), or ``None`` if the sampler
+    cannot construct it."""
+    return _BUILTIN_HANDLERS.get(reducer)
 
 
 def _requirement_symbols(req: PopulationRequirement) -> list[str]:
@@ -204,46 +293,38 @@ class PopulationSampler:
     def _is_coupled(req: PopulationRequirement) -> bool:
         """A requirement that jointly constrains several fields of one individual (only
         ``correlation`` in v1)."""
-        return req.aggregate.reducer_name == "correlation"
+        handler = _handler_for(req.aggregate.reducer_name)
+        return handler is not None and handler.coupled
 
     def _validate_requirement(self, req: PopulationRequirement) -> None:
         """Reject, up front, requirement shapes v1 cannot construct: unsupported operators or
         reducers, an ``>=``/``>``/``==`` on a distributional fit (a distance has no such target),
-        and multi-symbol (row-scoped/coupled) inner elements."""
+        and multi-symbol (row-scoped/coupled) inner elements. Per-reducer rules come from the
+        handler registry (see ``_BUILTIN_HANDLERS``)."""
         if req.operator not in _CONSTRUCTIBLE_OPERATORS:
             raise NotImplementedError(
                 f"Operator '{req.operator.value}' is not supported for a population requirement."
             )
         reducer = req.aggregate.reducer_name
-        constructible = {"fraction", "distinct_count", "correlation"} | set(
-            _DISTRIBUTION_QUANTILES
-        )
-        if reducer not in constructible:
+        handler = _handler_for(reducer)
+        if handler is None:
             raise NotImplementedError(
                 f"v1 constructs `fraction` quotas, `distinct_count` diversity, distributional "
                 f"fits ({', '.join(sorted(_DISTRIBUTION_QUANTILES))}), and `correlation`; got "
                 f"'{reducer}'."
             )
-        if reducer in _DISTRIBUTION_QUANTILES and req.operator not in (
-            Comparison.LESS_EQUAL,
-            Comparison.LESS,
-        ):
+        if req.operator not in handler.allowed_operators:
             raise NotImplementedError(
-                f"A distributional fit is a distance to a target; only `<=`/`<` are meaningful "
-                f"(match within delta). Got '{req.operator.value}' for '{reducer}'."
-            )
-        if reducer == "correlation" and req.operator is Comparison.EQUAL:
-            raise NotImplementedError(
-                "Constructing toward an exact correlation is future work; use `>=`/`>`/`<=`/`<`."
+                f"Operator '{req.operator.value}' is not supported for '{reducer}': "
+                f"{handler.operator_hint}."
             )
         symbols = _requirement_symbols(req)
-        if reducer == "correlation":
-            if len(symbols) != 2:
+        if len(symbols) != handler.arity:
+            if handler.coupled:
                 raise NotImplementedError(
-                    f"`correlation` constrains exactly two fields (its (x, y) tuple); "
+                    f"`{reducer}` constrains exactly {handler.arity} fields (its (x, y) tuple); "
                     f"'{reducer}(...)' reads {len(symbols)} ({', '.join(symbols)})."
                 )
-        elif len(symbols) != 1:
             raise NotImplementedError(
                 f"v1 constructs single-field requirements; '{reducer}(...)' reads "
                 f"{len(symbols)} symbols ({', '.join(symbols)}). Row-scoped/coupled requirements "
@@ -274,15 +355,11 @@ class PopulationSampler:
         ``symbol`` field into ``n`` individuals makes the requirement hold. Single-field reducers
         yield one-key maps (carrier = a whole valid individual); coupled ``correlation`` yields
         two-key maps."""
-        reducer = req.aggregate.reducer_name
-        if reducer == "correlation":
-            return self._correlation_plan(req, n)
-        if reducer == "fraction":
-            column = self._fraction_plan(req, n)
-        elif reducer == "distinct_count":
-            column = self._distinct_plan(req, n)
-        else:
-            column = self._distribution_plan(req, n)  # validated to be a distributional fit
+        handler = _handler_for(req.aggregate.reducer_name)
+        assert handler is not None  # guaranteed by _validate_requirement
+        if handler.coupled:
+            return handler.construct(self, req, n)  # already a column of {symbol: carrier} maps
+        column = handler.construct(self, req, n)  # list of whole carriers
         symbol = _requirement_symbols(req)[0]
         return [{symbol: tree} for tree in column]
 
@@ -299,16 +376,9 @@ class PopulationSampler:
     def _verify_dispatch(
         self, req: PopulationRequirement, batch: list[DerivationTree]
     ) -> None:
-        inner = self._inner(req)
-        reducer = req.aggregate.reducer_name
-        if reducer == "fraction":
-            self._verify(req, inner, batch, self._target_count(req, len(batch)))
-        elif reducer == "distinct_count":
-            self._verify_distinct(req, inner, batch)
-        elif reducer == "correlation":
-            self._verify_correlation(req, inner, batch)
-        else:
-            self._verify_fit(req, inner, batch)
+        handler = _handler_for(req.aggregate.reducer_name)
+        assert handler is not None  # guaranteed by _validate_requirement
+        handler.verify(self, req, self._inner(req), batch)
 
     # -- graft construction: set each requirement's field(s) into skeletons -- #
     def _sample_joint(self, n: int) -> list[DerivationTree]:
