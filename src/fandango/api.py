@@ -6,6 +6,7 @@ from collections.abc import Callable, Generator
 from typing import IO, Any, Optional, cast
 
 from fandango.constraints.constraint import Constraint
+from fandango.constraints.population import PopulationValue
 from fandango.constraints.population_sampler import PopulationSampler
 from fandango.constraints.soft import SoftValue
 from fandango.errors import (
@@ -392,6 +393,23 @@ class Fandango(FandangoBase):
                 return solutions + padding
         return []
 
+    @property
+    def population(self) -> list[DerivationTree]:
+        """The genetic algorithm's current working set (a copy), or ``[]`` before a run.
+
+        For soft population-level objectives (Mechanism A), it is this *steered working
+        set* — not the streamed solutions returned by ``fuzz()`` — that reflects the
+        objective. ``fuzz(return_population=True)`` runs the GA to completion and returns
+        this set directly.
+        """
+        if self.fandango is None:
+            return []
+        return list(self.fandango.population)
+
+    def _has_soft_population_objectives(self) -> bool:
+        """Whether any spec constraint is a soft population objective (Mechanism A)."""
+        return any(isinstance(c, PopulationValue) for c in self._constraints)
+
     def fuzz(
         self,
         *,
@@ -401,12 +419,18 @@ class Fandango(FandangoBase):
         max_generations: Optional[int] = None,
         infinite: bool = False,
         mode: FuzzingMode = FuzzingMode.COMPLETE,
+        return_population: bool = False,
         **settings: Any,
     ) -> list[DerivationTree]:
         """
         Create a Fandango population.
         :param extra_constraints: Additional constraints to apply
         :param solution_callback: What to do with each solution; receives the solution and a unique index
+        :param return_population: If True, run the GA to completion and return the final
+            steered working set instead of the streamed solutions. This is the path that
+            makes soft population-level objectives observable (the stream is dominated by
+            early, barely-steered individuals). Ignored for a hard population `where`,
+            which is constructed exactly.
         :param settings: Additional settings for the evolution algorithm
         :return: A list of derivation trees
         """
@@ -416,6 +440,25 @@ class Fandango(FandangoBase):
         if self._grammar.population_requirements:
             return self._fuzz_population(
                 desired_solutions, extra_constraints=extra_constraints
+            )
+
+        # Soft population objectives steer the *working set*, which fuzz()'s solution
+        # stream does not reflect. Return that working set on request; otherwise warn so
+        # the steering is not silently invisible (downstream finding #2).
+        if return_population:
+            return self._fuzz_return_population(
+                extra_constraints=extra_constraints,
+                desired_solutions=desired_solutions,
+                max_generations=max_generations,
+                mode=mode,
+                **settings,
+            )
+        if self._has_soft_population_objectives():
+            LOGGER.warning(
+                "This spec has a soft population-level objective, but fuzz() returns the "
+                "solution stream, which does not reflect the steered population. Call "
+                "fuzz(..., return_population=True) (or read the `population` property) to "
+                "get the steered working set."
             )
 
         max_generations, desired_solutions, infinite = (
@@ -480,6 +523,34 @@ class Fandango(FandangoBase):
         return PopulationSampler(
             self._grammar, constraints=per_tree_hard
         ).sample(desired_solutions)
+
+    def _fuzz_return_population(
+        self,
+        *,
+        extra_constraints: Optional[list[str]],
+        desired_solutions: Optional[int],
+        max_generations: Optional[int],
+        mode: FuzzingMode,
+        **settings: Any,
+    ) -> list[DerivationTree]:
+        """Run the GA to completion and return its final steered working set.
+
+        This is the symmetric counterpart to the hard-requirement path: a soft population
+        objective is a property of the *set*, so the meaningful output is the evolved
+        working set, not the one-at-a-time solution stream. The stream is drained (and
+        discarded) purely to drive the evolution to ``max_generations``.
+        """
+        max_generations, desired_solutions, _ = self._sanitize_runtime_end_settings(
+            mode, desired_solutions, max_generations, False, settings.get("use_fcc", False)
+        )
+        self.init_population(extra_constraints=extra_constraints, **settings)
+        for _ in self.generate_solutions(max_generations, mode):
+            pass  # advance the GA; the steered set is read from `.population` below
+        assert self.fandango is not None
+        population = list(self.fandango.population)
+        if desired_solutions is not None:
+            population = population[:desired_solutions]
+        return population
 
     def parse(
         self,

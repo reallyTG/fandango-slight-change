@@ -37,6 +37,7 @@ from fandango.constraints.population import (
 from fandango.constraints.failing_tree import Comparison
 from fandango.errors import FandangoValueError
 from fandango.evolution.algorithm import DefaultAlgorithm, LoggerLevel
+from fandango.api import Fandango
 from fandango.language.parse.parse import parse
 
 from .utils import RESOURCES_ROOT
@@ -943,3 +944,71 @@ class TestAttributionKnob(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFuzzReturnsPopulation(unittest.TestCase):
+    """Downstream finding #2: soft population objectives are invisible through the
+    fuzz() solution stream; fuzz(return_population=True) exposes the steered working set
+    through the public API (no reaching into DefaultAlgorithm)."""
+
+    SPEC = RESOURCES_ROOT / "population_mean.fan"
+    TARGET = 30
+    GENERATIONS = 100
+    POPULATION_SIZE = 40
+    SEED = 1
+
+    @staticmethod
+    def _numbers(trees):
+        values = []
+        for tree in trees:
+            values.extend(int(m) for m in re.findall(r"\d\d", str(tree)))
+        return values
+
+    def _fandango(self):
+        with open(self.SPEC) as f:
+            return Fandango(f, use_stdlib=False, use_cache=False)
+
+    def test_return_population_is_more_steered_than_stream(self):
+        stream = self._fandango().fuzz(
+            desired_solutions=self.POPULATION_SIZE,
+            max_generations=self.GENERATIONS,
+            random_seed=self.SEED,
+            population_size=self.POPULATION_SIZE,
+        )
+        pop = self._fandango().fuzz(
+            return_population=True,
+            max_generations=self.GENERATIONS,
+            random_seed=self.SEED,
+            population_size=self.POPULATION_SIZE,
+        )
+        stream_mean = statistics.mean(self._numbers(stream))
+        pop_mean = statistics.mean(self._numbers(pop))
+        # The steered working set must land clearly closer to the target than the stream.
+        self.assertLess(
+            abs(pop_mean - self.TARGET),
+            abs(stream_mean - self.TARGET) - 2.0,
+            f"return_population mean {pop_mean:.1f} not meaningfully closer to "
+            f"{self.TARGET} than stream mean {stream_mean:.1f}",
+        )
+
+    def test_population_property_exposes_working_set(self):
+        fd = self._fandango()
+        self.assertEqual(fd.population, [])  # empty before a run
+        pop = fd.fuzz(
+            return_population=True,
+            max_generations=10,
+            random_seed=self.SEED,
+            population_size=self.POPULATION_SIZE,
+        )
+        self.assertTrue(pop)
+        self.assertEqual(len(fd.population), len(pop))
+
+    def test_desired_solutions_caps_returned_population(self):
+        pop = self._fandango().fuzz(
+            return_population=True,
+            desired_solutions=5,
+            max_generations=10,
+            random_seed=self.SEED,
+            population_size=self.POPULATION_SIZE,
+        )
+        self.assertEqual(len(pop), 5)
