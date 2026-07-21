@@ -5,8 +5,9 @@
 # (e.g. `- 0.3` inside an `abs(... )` to aim for 30% F).
 #
 # `fraction(<predicate> for x in population)` = share of records satisfying the
-# predicate. This is a soft *bias*, not a hard quota — see Mechanism B
-# (`requiring ... == 0.3`) if you need an exact proportion guarantee.
+# predicate. This is a soft *bias*, not a hard quota — for an exact proportion
+# guarantee use a hard population `where` (Mechanism B), e.g.
+# `where fraction(<sex> == "F" for x in population) == 0.3`.
 #
 # Run:
 #   PYTHONPATH=src fandango fuzz -f examples/population_objectives/02_category_fraction.fan -n 20

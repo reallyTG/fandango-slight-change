@@ -261,3 +261,104 @@ you express your own.
 ```{versionadded} 1.x
 Population-level soft objectives are an experimental addition.
 ```
+
+## Hard Population-Level Requirements
+
+A soft objective *steers* the distribution; a **hard population `where`** *guarantees* it
+over the emitted batch. Any `where` that mentions the reserved `population` binder is
+promoted to a population requirement, routed **around** the genetic algorithm to a sampler
+that *constructs* a batch of the requested size — you must pass a fixed `-n N` /
+`desired_solutions=N`. Per-record `where` constraints still apply and are co-enforced (every
+constructed individual satisfies them). A full runnable example is `docs/adult-hard.fan`.
+
+```
+# exactly 24% of records have income == 1 (a quota, exact by construction)
+where fraction(int(<income>) == 1 for x in population) == 0.24
+
+# at least 12 distinct occupations appear across the batch
+where distinct_count(<occupation> for x in population) >= 12
+
+# the <age> column matches Normal(38, 13) within a Wasserstein tolerance
+where normal_fit([int(<age>) for x in population], 38, 13) <= 0.7
+
+# two columns correlate at (approximately) the target
+where correlation((int(<education_num>), int(<hours>)) for x in population) >= 0.3
+```
+
+### What each shape guarantees
+
+| Requirement | Guarantee | Notes |
+|---|---|---|
+| `fraction(<pred>) == p` (`>=`/`<=` too) | exact by construction | `== p` snaps to the nearest achievable `round(p·N)/N` and warns when `p·N` is non-integral |
+| `distinct_count(<field>) OP K` | exact integer count | reach (`>=`/`>`/`==`) or cap (`<=`/`<`) |
+| `normal_fit`/`lognormal_fit`/`uniform_fit`/`exponential_fit(...) <= δ` | within δ by construction | δ is a 1-Wasserstein distance; only `<=`/`<` are meaningful |
+| `correlation((<x>,<y>)) OP r` | toward r | `>=`/etc. drive to the ±1 extreme; `== r` targets r via a copula search within `correlation_tolerance` |
+
+Requirements are combined when they target **disjoint fields** (each field is constrained by
+at most one requirement); same-field and nested-field sets are rejected with a clear error.
+
+```{admonition} The discretization floor (why δ can't be arbitrarily small)
+:class: note
+A continuous target realized on an **integer** (or otherwise gridded) field sits a fixed
+distance from the true continuous distribution no matter how the values are placed — about
+`h/4` for a grid step `h` (≈ 0.25 for integers). A `δ` below that floor is *unsatisfiable in
+principle*, and the sampler says so precisely rather than reporting a generic shortfall. Keep
+`δ` above the floor.
+
+On this by-construction path the batch's order statistics are *placed* on the target
+quantiles, so the gate is the achieved point-estimate distance (a regression check that
+structuring didn't perturb the draw), not a bootstrap confidence bound — resampling a
+deliberately quantile-placed batch would wildly overstate the distance. The bootstrap
+equivalence test in `statistics/equivalence.py` is there for a future subset-selection path,
+where the sample *is* an i.i.d. draw.
+```
+
+### Shortfall policy
+
+If a requirement can't be met (a grammar too coarse to reach `δ`, an infeasible cell),
+`on_shortfall` decides what happens: `fail_loud` (default) raises with a precise diagnosis;
+`best_effort` warns and returns the closest assembled batch. From the CLI:
+
+```shell
+$ fandango fuzz -f adult-hard.fan -n 200 --on-shortfall best_effort
+```
+
+### Custom requirements
+
+`register_requirement` adds a requirement the sampler can *construct* toward — the paired
+counterpart to `register_reducer` (which only verifies). Supply a `check` (the batch-level
+aggregate, also usable as a soft reducer) and a `sample(n, *params)` that returns `n` target
+values the sampler pins a column to; an optional `floor` gives the discretization diagnosis:
+
+```python
+from fandango.constraints.population import register_requirement
+
+register_requirement(
+    "banded_uniform",
+    check=lambda values, lo, hi: uniform_fit_distance(values, lo, hi),
+    sample=lambda n, lo, hi: [lo + (i + 0.5) / n * (hi - lo) for i in range(n)],
+    allowed_operators=frozenset({"<=", "<"}),
+    target_arity=2,
+)
+# then, in a spec parsed after this call:
+#   where banded_uniform([int(<age>) for x in population], 10, 40) <= 0.5
+```
+
+A reducer may also declare a `grouping` policy for multi-valued fields: `pool` (default,
+flatten every individual's values into one pool), or `per_entry` (the reducer receives one
+list per individual — `list[list]`; honored by the soft path). Registration is process-wide
+and must run **before** the spec is parsed.
+
+### Honest limits (v1)
+
+- **Per-row coupling / conditional `P(y|x)`** is not yet constructed field-by-field: emit the
+  whole correlated tuple from one **umbrella symbol**'s `:=` generator instead (so the coupling
+  is baked in by construction). `>2`-way coupling and stratified/grouped quotas are future work.
+- **Per-record chained comparisons** (`17 <= int(<age>) <= 90`) are not co-enforced by the
+  sampler; use two simple `where` lines (`>= 17` and `<= 90`).
+- The multiplicity `per_entry`/`per_row` *construction* path (only the soft path honors them
+  today) and per-spec `grouping=` call syntax are future work.
+
+```{versionadded} 1.x
+Hard population-level requirements (Mechanism B) are an experimental addition.
+```
