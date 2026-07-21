@@ -54,6 +54,7 @@ from fandango.errors import FandangoValueError
 from fandango.language.grammar.grammar import Grammar
 from fandango.language.tree import DerivationTree
 from fandango.logger import LOGGER
+from fandango.statistics.equivalence import discretization_floor, is_delta_below_floor
 
 # Comparison operators the sampler can construct toward. ``!=`` is intentionally excluded: "not
 # exactly 30%" / "not exactly K distinct" is an odd guarantee with no natural construction target.
@@ -682,14 +683,35 @@ class PopulationSampler:
         self, req: PopulationRequirement, inner: _InnerValue, batch: list[DerivationTree]
     ) -> None:
         """Independent gate: the assembled batch's distributional fit must satisfy the operator.
-        A coarse grammar may be unable to reach ``delta``; that surfaces here as a shortfall."""
-        values = [self._sole_value(inner, tree) for tree in batch]
+
+        On this by-construction path the batch's order statistics are *placed* on the target
+        quantiles, so the fit distance IS the achieved point estimate — that is the right gate
+        here (see the module note on why a bootstrap CI, which assumes an iid draw, is not:
+        resampling a deliberately quantile-placed batch wildly overstates the distance). Two
+        distinct failure modes are separated:
+
+        * ``delta`` below the **discretization floor** ``~h/4`` (``h`` = the field's value step):
+          unsatisfiable *in principle* — no placement of a grid-valued field can get that close
+          to a continuous target. Reported precisely, not as a generic "coarse grammar".
+        * otherwise the grammar is simply too coarse to reach ``delta`` at this N -- a shortfall.
+        """
+        values = [float(self._sole_value(inner, tree)) for tree in batch]
         actual = REDUCERS[req.aggregate.reducer_name](values, *req.aggregate.reducer_args)
+        below_floor, floor = is_delta_below_floor(float(req.bound), values)
+        if below_floor:
+            raise PopulationShortfallError(
+                f"Requirement '{req.aggregate.reducer_name} {req.operator.value} {req.bound}' "
+                f"is unsatisfiable in principle: delta={req.bound} is below the discretization "
+                f"floor ~{floor:.4f} for this field (its values step by ~{4 * floor:.4g}, so a "
+                f"rounded field sits at least ~{floor:.4f} from a continuous target no matter "
+                f"how it is placed). Raise delta to at least ~{floor:.4f}."
+            )
         if not req.operator.compare(actual, req.bound):
             raise PopulationShortfallError(
                 f"Verification gate failed for '{req.aggregate.reducer_name} "
-                f"{req.operator.value} {req.bound}': assembled batch has fit {actual:.4f}. The "
-                f"grammar may be too coarse to match the target distribution that closely."
+                f"{req.operator.value} {req.bound}': assembled batch has fit {actual:.4f} "
+                f"(discretization floor ~{floor:.4f}). The grammar may be too coarse to match "
+                f"the target distribution that closely at N={len(batch)}."
             )
 
     # -- coupled correlation: pair two fields to reach the target correlation - #

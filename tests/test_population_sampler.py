@@ -279,6 +279,19 @@ class TestPopulationSamplerDistribution(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             PopulationSampler(grammar).sample(30)
 
+    def test_delta_below_discretization_floor_is_diagnosed(self):
+        # Integer ages step by 1 -> discretization floor ~0.25. A delta of 0.05 is
+        # unsatisfiable *in principle* (no placement of a rounded field gets that close to
+        # a continuous Normal), and must be diagnosed precisely, not as a generic shortfall.
+        grammar = _age_grammar_with(
+            "where normal_fit([int(<age>) for x in population], 30, 5) <= 0.05"
+        )
+        with self.assertRaises(PopulationShortfallError) as ctx:
+            PopulationSampler(grammar).sample(30)
+        message = str(ctx.exception)
+        self.assertIn("discretization floor", message)
+        self.assertIn("unsatisfiable in principle", message)
+
 
 class TestPopulationSamplerCoEnforcement(unittest.TestCase):
     """A per-tree hard `where` alongside a population requirement: every constructed individual
