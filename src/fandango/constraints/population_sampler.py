@@ -59,6 +59,7 @@ from fandango.constraints.population import (
     PopulationRequirement,
     RequirementHandler,
     _InnerValue,
+    grouping_for,
 )
 from fandango.errors import FandangoValueError
 from fandango.language.grammar.grammar import Grammar
@@ -387,6 +388,13 @@ class PopulationSampler:
             raise NotImplementedError(
                 f"Operator '{req.operator.value}' is not supported for '{reducer}': "
                 f"{handler.operator_hint}."
+            )
+        grouping = grouping_for(reducer)
+        if grouping != "pool":
+            raise NotImplementedError(
+                f"'{reducer}' declares grouping='{grouping}', but the sampler constructs only "
+                f"pooled (single-value-per-individual) requirements in v1; constructing a "
+                f"'{grouping}' batch is future work. (The soft objective path honors it.)"
             )
         symbols = _requirement_symbols(req)
         if len(symbols) != handler.arity:

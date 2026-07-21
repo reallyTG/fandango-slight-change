@@ -9,11 +9,13 @@ import unittest
 from pathlib import Path
 
 from fandango.constraints.population import (
+    REDUCER_GROUPING,
     REDUCER_MARGINALS,
     REDUCER_TARGET_ARITY,
     REDUCERS,
     PopulationRequirement,
     PopulationValue,
+    grouping_for,
     _correlation,
     _count,
     _count_marginal,
@@ -1012,3 +1014,53 @@ class TestFuzzReturnsPopulation(unittest.TestCase):
             population_size=self.POPULATION_SIZE,
         )
         self.assertEqual(len(pop), 5)
+
+
+class TestGroupingPolicy(unittest.TestCase):
+    """P5: grouping is a declared property of the reducer. `pool` (default) flattens every
+    individual's values into one pool; `per_entry` hands the reducer list[list] (reduce
+    within-then-across). Declared at registration, honored by the soft evaluator."""
+
+    def tearDown(self):
+        for registry in (
+            REDUCERS,
+            REDUCER_TARGET_ARITY,
+            REDUCER_MARGINALS,
+            REDUCER_GROUPING,
+        ):
+            registry.pop("count_per_entry", None)
+            registry.pop("bad_group", None)
+
+    def test_register_reducer_validates_grouping(self):
+        with self.assertRaises(FandangoValueError):
+            register_reducer("bad_group", lambda values: 0.0, grouping="nonsense")
+
+    def test_grouping_for_defaults_to_pool(self):
+        self.assertEqual(grouping_for("mean"), "pool")
+        self.assertEqual(grouping_for("never_registered"), "pool")
+
+    def test_per_entry_reducer_receives_list_of_lists(self):
+        seen: list = []
+
+        def count_per_entry(entries):
+            # Under per_entry the reducer receives one list per individual, not a flat pool.
+            seen.append(entries)
+            return float(sum(len(e) for e in entries))
+
+        register_reducer("count_per_entry", count_per_entry, grouping="per_entry")
+        self.assertEqual(grouping_for("count_per_entry"), "per_entry")
+
+        grammar, c = _parse_spec(
+            "minimizing count_per_entry(int(<age>) for x in population)"
+        )
+        pv = PopulationValue(
+            c.optimization_goal,
+            c.expression,
+            aggregate=try_parse_population_aggregate(c.expression, c.searches),
+            local_variables=c.local_variables,
+            global_variables=c.global_variables,
+        )
+        pv.evaluate_population(_real_population(grammar, 4))
+        self.assertTrue(seen, "reducer was never called")
+        # Every element handed to the reducer is itself a list (one entry's values).
+        self.assertTrue(all(isinstance(entry, list) for entry in seen[0]))

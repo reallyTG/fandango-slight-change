@@ -177,6 +177,24 @@ REDUCER_TARGET_ARITY: dict[str, int] = {
     "exponential_fit": 1,
 }
 
+# Multiplicity policy for a reducer whose field can occur several times per individual:
+#   "pool"      -- flatten every individual's values into one pool (the default; each extra
+#                  value is just another sample). Built-ins use this.
+#   "per_entry" -- keep each individual's values as a list; the reducer receives list[list]
+#                  and reduces within-then-across. For a custom reducer that expects grouped
+#                  input. Forces `loo` attribution (marginal companions assume a flat pool).
+#   "per_row"   -- the existing multi-symbol row-scoping (auto-inferred when the inner element
+#                  reads two fields, so they stay paired row-wise); not selected by this knob.
+# Grouping is a property of the *reducer* (declared at registration), not per-call syntax,
+# because a reducer's expected input shape is intrinsic to it. Absent means "pool".
+_GROUPING_POLICIES = frozenset({"pool", "per_entry", "per_row"})
+REDUCER_GROUPING: dict[str, str] = {}
+
+
+def grouping_for(reducer: str) -> str:
+    """The declared multiplicity policy for ``reducer`` (``"pool"`` if unset)."""
+    return REDUCER_GROUPING.get(reducer, "pool")
+
 
 @dataclass(frozen=True)
 class RequirementHandler:
@@ -342,6 +360,7 @@ def register_reducer(
     *,
     target_arity: int = 0,
     marginal: Optional[Callable[..., list[float]]] = None,
+    grouping: str = "pool",
 ) -> None:
     """Register a population reducer so it can be used in an objective by ``name``.
 
@@ -385,6 +404,10 @@ def register_reducer(
         )
     if target_arity < 0:
         raise FandangoValueError(f"target_arity must be >= 0, got {target_arity}.")
+    if grouping not in _GROUPING_POLICIES:
+        raise FandangoValueError(
+            f"grouping must be one of {sorted(_GROUPING_POLICIES)}; got {grouping!r}."
+        )
     if name in REDUCERS:
         LOGGER.info(f"Overriding existing population reducer {name!r}.")
     REDUCERS[name] = reducer
@@ -392,6 +415,12 @@ def register_reducer(
         REDUCER_TARGET_ARITY[name] = target_arity
     else:
         REDUCER_TARGET_ARITY.pop(name, None)
+    # Keep grouping in lockstep too: a re-registration back to the default clears any stale
+    # non-default policy so the reducer cleanly pools again.
+    if grouping != "pool":
+        REDUCER_GROUPING[name] = grouping
+    else:
+        REDUCER_GROUPING.pop(name, None)
     # Keep the marginal registry in lockstep: a re-registration without a marginal must clear
     # any stale companion so the reducer cleanly falls back to loo instead of pairing a new
     # reducer with an old, mismatched gradient.
@@ -478,7 +507,9 @@ def register_requirement(
     Like all registration, this mutates process-wide state and must run **before** the
     spec that references ``name`` is parsed.
     """
-    register_reducer(name, check, target_arity=target_arity, marginal=marginal)
+    register_reducer(
+        name, check, target_arity=target_arity, marginal=marginal, grouping=grouping
+    )
     REQUIREMENT_HANDLERS[name] = RequirementHandler(
         check=check,
         sample=sample,
@@ -1027,13 +1058,22 @@ class PopulationValue(SoftValue):
         return outer_full - outer_perturbed
 
     def _loo_rewards(
-        self, per_tree: list[list[Any]], outer_full: float
+        self, per_tree: list[list[Any]], outer_full: float, grouping: str = "pool"
     ) -> list[float]:
-        """Leave-one-out: re-score the objective over the population minus each tree."""
+        """Leave-one-out: re-score the objective over the population minus each tree.
+
+        Under ``pool`` the removed tree's values are dropped from the flat pool; under
+        ``per_entry`` the reducer consumes ``list[list]``, so the removed tree's whole list
+        is dropped and the rest stays grouped."""
         rewards: list[float] = []
         for i in range(len(per_tree)):
-            rest = [v for j, values in enumerate(per_tree) if j != i for v in values]
-            if not rest:
+            if grouping == "per_entry":
+                rest: list[Any] = [v for j, v in enumerate(per_tree) if j != i]
+                has_values = any(rest)
+            else:
+                rest = [v for j, values in enumerate(per_tree) if j != i for v in values]
+                has_values = bool(rest)
+            if not has_values:
                 rewards.append(0.0)
                 continue
             try:
@@ -1097,14 +1137,22 @@ class PopulationValue(SoftValue):
         if n == 0:
             return []
 
+        grouping = grouping_for(self.aggregate.reducer_name)
         per_tree = self._inner_values_per_tree(population)
         all_values = [v for values in per_tree for v in values]
         if not all_values:
             # Nothing to aggregate (e.g. constraint not yet satisfiable) — no signal.
             return [0.0] * n
+        # `per_entry` hands the reducer the list-of-lists directly (reduce within-then-across);
+        # `pool`/`per_row` feed it the flat pool as before.
+        aggregation_input: list[Any] = (
+            [list(values) for values in per_tree]
+            if grouping == "per_entry"
+            else all_values
+        )
 
         try:
-            agg_full = self._aggregate(all_values)
+            agg_full = self._aggregate(aggregation_input)
             outer_full = self._outer_from_aggregate(agg_full)
         except Exception as e:  # keep the GA alive on a bad user expression
             LOGGER.error(
@@ -1128,10 +1176,11 @@ class PopulationValue(SoftValue):
         # NOTE: min-max normalization amplifies arbitrarily small reward differences to the
         # full range; smarter scaling is a tuning lever kept separate so `loo` vs `marginal`
         # A/Bs change exactly one variable (see PLAN-marginal-attribution.md §5, §11).
-        if self.attribution == "marginal":
+        # marginal companions assume a flat pool, so per_entry falls back to loo.
+        if self.attribution == "marginal" and grouping != "per_entry":
             rewards = self._marginal_rewards(per_tree, all_values, agg_full, outer_full)
         else:
-            rewards = self._loo_rewards(per_tree, outer_full)
+            rewards = self._loo_rewards(per_tree, outer_full, grouping=grouping)
 
         lo, hi = min(rewards), max(rewards)
         if hi - lo < 1e-12:

@@ -767,3 +767,46 @@ class TestPopulationSamplerShortfallPolicy(unittest.TestCase):
     def test_invalid_policy_rejected(self):
         with self.assertRaises(FandangoValueError):
             PopulationSampler(_grammar_with(), on_shortfall="relax_to_nearest_feasible")
+
+
+class TestSamplerGroupingRejection(unittest.TestCase):
+    """P5: the sampler constructs only pooled (single-value-per-individual) requirements in v1.
+    A reducer declaring a non-pool grouping is refused with a precise, policy-named error."""
+
+    def setUp(self):
+        random.seed(0)
+
+    def tearDown(self):
+        from fandango.constraints.population import (
+            REDUCERS,
+            REDUCER_GROUPING,
+            REDUCER_TARGET_ARITY,
+            REQUIREMENT_HANDLERS,
+        )
+
+        for registry in (
+            REDUCERS,
+            REDUCER_TARGET_ARITY,
+            REDUCER_GROUPING,
+            REQUIREMENT_HANDLERS,
+        ):
+            registry.pop("per_entry_fit", None)
+
+    def test_per_entry_reducer_construction_is_refused(self):
+        from fandango.constraints.population import register_requirement
+
+        # A per_entry handler that otherwise looks constructible (has a sample).
+        register_requirement(
+            "per_entry_fit",
+            check=lambda entries, target: 0.0,
+            sample=lambda n, target: [target] * n,
+            grouping="per_entry",
+            target_arity=1,
+            allowed_operators=frozenset({"<=", "<"}),
+        )
+        grammar = _age_grammar_with(
+            "where per_entry_fit([int(<age>) for x in population], 30) <= 0.5"
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            PopulationSampler(grammar).sample(10)
+        self.assertIn("per_entry", str(ctx.exception))
