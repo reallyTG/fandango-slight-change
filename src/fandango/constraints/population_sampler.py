@@ -21,8 +21,12 @@ v1 covers three construction cases, all requiring exactly one inner value per in
 Multiple population requirements are combined when they target **disjoint fields**: each requirement
 plans a per-tree column of source individuals (via the same selection logic), and the chosen field
 subtree is grafted into shared skeleton individuals -- disjoint fields mean the grafts don't
-interfere, so each requirement's verify gate holds independently. Requirements on the same field, or
-whose fields nest, are rejected.
+interfere, so each requirement's verify gate holds independently. Requirements whose fields nest are
+rejected. The one *same*-field case that IS combined is several ``fraction(<pred>) == p`` requirements
+on one field: they form a **categorical distribution** over that field (a ``_MultinomialJob``), which
+buckets individuals by which single (mutually-exclusive) cell predicate they satisfy into exact
+per-value counts -- with a free "anything else" remainder when the declared fractions sum to < 1.
+Mixing operators or reducers on one field is still rejected.
 
 A final verification gate re-checks the assembled batch in every case, and per-tree hard constraints
 from the spec are co-enforced -- every constructed individual is drawn to satisfy them (the
@@ -278,6 +282,36 @@ def _is_prefix(shorter: tuple, longer: tuple) -> bool:
     return len(shorter) <= len(longer) and tuple(longer[: len(shorter)]) == tuple(shorter)
 
 
+# Float slack when checking that same-field fraction cells sum to <= 1 (0.2+0.4+0.1+0.3 may not be
+# exactly 1.0 in binary).
+_FRACTION_SUM_EPS = 1e-9
+
+
+@dataclass(frozen=True)
+class _MultinomialJob:
+    """Several ``fraction(<pred over one field>) == p`` requirements on the *same* field, grouped as
+    one categorical-distribution job: the cells partition that field into exact integer counts, with
+    a free "anything else" remainder when the declared fractions sum to < 1.
+
+    A job is the unit the sampler plans/grafts/verifies over -- either a plain
+    :class:`PopulationRequirement` (single reducer) or one of these. ``symbol`` is the shared field;
+    ``cells`` are the per-value ``fraction ==`` requirements (each read as its own predicate)."""
+
+    symbol: str
+    cells: tuple[PopulationRequirement, ...]
+
+
+# A planning/verification unit: a single requirement, or a grouped same-field multinomial.
+_Job = Any  # PopulationRequirement | _MultinomialJob
+
+
+def _job_symbols(job: _Job) -> list[str]:
+    """The grammar field symbol(s) a job owns (used for cross-job disjointness)."""
+    if isinstance(job, _MultinomialJob):
+        return [job.symbol]
+    return _requirement_symbols(job)
+
+
 class PopulationShortfallError(FandangoValueError):
     """Raised when the sampler cannot assemble a batch meeting a requirement within budget."""
 
@@ -350,15 +384,17 @@ class PopulationSampler:
             return [self._candidate() for _ in range(n)]
         for req in self.requirements:
             self._validate_requirement(req)
+        # Group same-field `fraction ==` requirements into one multinomial job; everything else is
+        # its own job. Planning/grafting/verification all run over jobs from here on.
+        jobs = self._build_jobs()
         self._last_batch = None
         try:
-            # A lone single-field requirement materializes whole source individuals directly; a
-            # coupled requirement (or several) needs the graft path, which sets each field into a
-            # shared skeleton.
-            if len(self.requirements) == 1 and not self._is_coupled(self.requirements[0]):
-                return self._sample_single(self.requirements[0], n)
-            self._validate_disjoint()
-            return self._sample_joint(n)
+            # A lone single-field job materializes whole source individuals directly; a coupled job
+            # (or several jobs) needs the graft path, which sets each field into a shared skeleton.
+            if len(jobs) == 1 and not self._job_is_coupled(jobs[0]):
+                return self._sample_single(jobs[0], n)
+            self._validate_disjoint(jobs)
+            return self._sample_joint(jobs, n)
         except PopulationShortfallError as shortfall:
             if self._on_shortfall != "best_effort":
                 raise
@@ -378,6 +414,50 @@ class PopulationSampler:
         ``correlation`` in v1)."""
         handler = _handler_for(req.aggregate.reducer_name)
         return handler is not None and handler.coupled
+
+    @classmethod
+    def _job_is_coupled(cls, job: _Job) -> bool:
+        """A multinomial job is never coupled (one field); otherwise defer to the reducer."""
+        return not isinstance(job, _MultinomialJob) and cls._is_coupled(job)
+
+    def _build_jobs(self) -> list[_Job]:
+        """Fold the flat requirement list into planning jobs. Several ``fraction`` requirements that
+        read the *same* single field become one :class:`_MultinomialJob` (a categorical distribution
+        over that field); every other requirement -- and a lone same-field ``fraction`` -- stays a
+        plain requirement. Jobs keep first-appearance order for deterministic construction.
+
+        A same-field group of size > 1 must be all ``fraction ==`` cells: a mixed operator (e.g. a
+        ``>=`` alongside ``==``) or a non-``fraction`` reducer on the field is rejected here, since a
+        marginal-count partition is only well defined for exact-fraction cells."""
+        frac_by_symbol: dict[str, list[PopulationRequirement]] = {}
+        slots: dict[str, int] = {}  # symbol -> index in `jobs` its group occupies
+        jobs: list[_Job] = []
+        for req in self.requirements:
+            symbols = _requirement_symbols(req)
+            if req.aggregate.reducer_name == "fraction" and len(symbols) == 1:
+                sym = symbols[0]
+                if sym not in frac_by_symbol:
+                    frac_by_symbol[sym] = []
+                    slots[sym] = len(jobs)
+                    jobs.append(sym)  # placeholder, resolved below once the group is complete
+                frac_by_symbol[sym].append(req)
+            else:
+                jobs.append(req)
+        for sym, idx in slots.items():
+            cells = frac_by_symbol[sym]
+            if len(cells) == 1:
+                jobs[idx] = cells[0]  # a lone fraction is just its requirement (unchanged path)
+                continue
+            non_equal = [c for c in cells if c.operator is not Comparison.EQUAL]
+            if non_equal:
+                raise FandangoValueError(
+                    f"Field {sym} carries several `fraction` requirements ({len(cells)}), which form "
+                    f"a categorical distribution over {sym} -- but every cell must use `==` (an exact "
+                    f"share). Got operator '{non_equal[0].operator.value}' on one of them. Mixed "
+                    f"operators or `>=`/`<=` cells on one field are future work; use `== p` per value."
+                )
+            jobs[idx] = _MultinomialJob(sym, tuple(cells))
+        return jobs
 
     def _validate_requirement(self, req: PopulationRequirement) -> None:
         """Reject, up front, requirement shapes v1 cannot construct: unsupported operators or
@@ -421,69 +501,78 @@ class PopulationSampler:
                 f"beyond `correlation` are future work."
             )
 
-    def _validate_disjoint(self) -> None:
-        """Requirements must target distinct fields (any shared symbol = same-field joint, out of
-        scope -- e.g. a coupled field also used by a marginal requirement). Nested-field
-        (containment) collisions are caught structurally at graft time."""
+    def _validate_disjoint(self, jobs: list[_Job]) -> None:
+        """Distinct *jobs* must target distinct fields. Same-field ``fraction`` cells are already
+        folded into one multinomial job (allowed), so a residual shared symbol across jobs means an
+        incompatible pairing -- e.g. a ``distinct_count`` and a ``fraction`` on the same field, or a
+        coupled field also used by a marginal. Nested-field (containment) collisions are caught
+        structurally at graft time."""
         seen: dict[str, str] = {}
-        for req in self.requirements:
-            for symbol in _requirement_symbols(req):
+        for job in jobs:
+            name = (
+                f"fraction distribution over {job.symbol}"
+                if isinstance(job, _MultinomialJob)
+                else job.aggregate.reducer_name
+            )
+            for symbol in _job_symbols(job):
                 if symbol in seen:
                     raise FandangoValueError(
                         f"Two population requirements target the same field {symbol} "
-                        f"('{seen[symbol]}' and '{req.aggregate.reducer_name}'). Jointly "
-                        f"constraining one field with several requirements is future work; use "
-                        f"disjoint fields."
+                        f"('{seen[symbol]}' and '{name}'). Combining different reducers on one field "
+                        f"is future work; use disjoint fields. (Several `fraction == p` cells on one "
+                        f"field ARE combined -- as a categorical distribution.)"
                     )
-                seen[symbol] = req.aggregate.reducer_name
+                seen[symbol] = name
 
     # -- dispatch: a per-slot {symbol: source individual} column ------------- #
-    def _plan(
-        self, req: PopulationRequirement, n: int
-    ) -> list[dict[str, DerivationTree]]:
+    def _plan(self, job: _Job, n: int) -> list[dict[str, DerivationTree]]:
         """A length-``n`` column of per-slot ``{symbol: carrier}`` maps: grafting each carrier's
-        ``symbol`` field into ``n`` individuals makes the requirement hold. Single-field reducers
-        yield one-key maps (carrier = a whole valid individual); coupled ``correlation`` yields
-        two-key maps."""
-        handler = _handler_for(req.aggregate.reducer_name)
+        ``symbol`` field into ``n`` individuals makes the job hold. Single-field reducers (and a
+        multinomial job) yield one-key maps (carrier = a whole valid individual); coupled
+        ``correlation`` yields two-key maps."""
+        if isinstance(job, _MultinomialJob):
+            column = self._multinomial_plan(job, n)  # list of whole carriers
+            return [{job.symbol: tree} for tree in column]
+        handler = _handler_for(job.aggregate.reducer_name)
         assert handler is not None  # guaranteed by _validate_requirement
         if handler.coupled:
-            return handler.construct(self, req, n)  # already a column of {symbol: carrier} maps
-        column = handler.construct(self, req, n)  # list of whole carriers
-        symbol = _requirement_symbols(req)[0]
+            return handler.construct(self, job, n)  # already a column of {symbol: carrier} maps
+        column = handler.construct(self, job, n)  # list of whole carriers
+        symbol = _requirement_symbols(job)[0]
         return [{symbol: tree} for tree in column]
 
-    def _sample_single(self, req: PopulationRequirement, n: int) -> list[DerivationTree]:
-        """One single-field requirement: each source is already a whole valid individual, so
-        materialize the column directly (deep-copy) and verify -- no grafting needed."""
+    def _sample_single(self, job: _Job, n: int) -> list[DerivationTree]:
+        """One single-field job: each source is already a whole valid individual, so materialize the
+        column directly (deep-copy) and verify -- no grafting needed."""
         batch = [
             next(iter(slot.values())).deepcopy(copy_parent=False)
-            for slot in self._plan(req, n)
+            for slot in self._plan(job, n)
         ]
         self._last_batch = batch  # closest miss for best_effort, before the gate can raise
-        self._verify_dispatch(req, batch)
+        self._verify_dispatch(job, batch)
         return batch
 
-    def _verify_dispatch(
-        self, req: PopulationRequirement, batch: list[DerivationTree]
-    ) -> None:
-        handler = _handler_for(req.aggregate.reducer_name)
+    def _verify_dispatch(self, job: _Job, batch: list[DerivationTree]) -> None:
+        if isinstance(job, _MultinomialJob):
+            self._verify_multinomial(job, batch)
+            return
+        handler = _handler_for(job.aggregate.reducer_name)
         assert handler is not None  # guaranteed by _validate_requirement
-        handler.verify(self, req, self._inner(req), batch)
+        handler.verify(self, job, self._inner(job), batch)
 
-    # -- graft construction: set each requirement's field(s) into skeletons -- #
-    def _sample_joint(self, n: int) -> list[DerivationTree]:
-        """Graft-based construction (several disjoint-field requirements, or a lone coupled one):
-        plan a per-slot ``{symbol: carrier}`` column per requirement, then graft every requirement's
-        field(s) into ``n`` shared skeleton individuals. Disjoint fields don't interfere, so each
-        requirement's verify gate holds independently; a coupled requirement's two fields are grafted
-        together so the pair holds per individual."""
+    # -- graft construction: set each job's field(s) into skeletons ---------- #
+    def _sample_joint(self, jobs: list[_Job], n: int) -> list[DerivationTree]:
+        """Graft-based construction (several disjoint-field jobs, or a lone coupled one): plan a
+        per-slot ``{symbol: carrier}`` column per job, then graft every job's field(s) into ``n``
+        shared skeleton individuals. Disjoint fields don't interfere, so each job's verify gate holds
+        independently; a coupled requirement's two fields are grafted together so the pair holds per
+        individual."""
         skeletons = [self._candidate() for _ in range(n)]
-        columns = {i: self._plan(req, n) for i, req in enumerate(self.requirements)}
+        columns = {i: self._plan(job, n) for i, job in enumerate(jobs)}
         batch = self._graft_all(skeletons, columns)
         self._last_batch = batch  # closest miss for best_effort, before any gate can raise
-        for req in self.requirements:
-            self._verify_dispatch(req, batch)
+        for job in jobs:
+            self._verify_dispatch(job, batch)
         self._recheck_constraints(batch)
         return batch
 
@@ -494,11 +583,11 @@ class PopulationSampler:
     ) -> list[DerivationTree]:
         batch: list[DerivationTree] = []
         for slot, skeleton in enumerate(skeletons):
-            # Every (symbol -> carrier) graft for this individual, across all requirements (a
-            # coupled requirement contributes two).
+            # Every (symbol -> carrier) graft for this individual, across all jobs (a coupled
+            # requirement contributes two).
             grafts = [
                 (symbol, carrier)
-                for i in range(len(self.requirements))
+                for i in range(len(columns))
                 for symbol, carrier in columns[i][slot].items()
             ]
             symbols = [symbol for symbol, _ in grafts]
@@ -686,6 +775,132 @@ class PopulationSampler:
                 f"Verification gate failed for 'fraction {req.operator.value} {req.bound}': "
                 f"assembled batch has {achieved} satisfying individuals, expected {target_true}."
             )
+
+    # -- categorical distribution: partition one field into exact cell counts - #
+    @staticmethod
+    def _readable_predicate(cell: PopulationRequirement) -> str:
+        """The cell's inner predicate with mangled search names restored to their ``<symbol>`` form
+        (e.g. ``int(<cat>) == 1``), for user-facing error messages."""
+        text = cell.aggregate.inner_expression
+        for key, search in cell.aggregate.inner_searches.items():
+            access = search.get_access_points()
+            if access:
+                text = text.replace(key, str(access[0]))
+        return text
+
+    def _apportion_counts(
+        self, fractions: list[Any], n: int
+    ) -> tuple[list[int], bool]:
+        """Integer per-cell counts summing to exactly ``n`` (largest-remainder / Hamilton), plus a
+        flag for whether a trailing free "remainder" cell was appended.
+
+        The fractions are validated in ``[0, 1]`` with ``sum <= 1``. When they sum to < 1 a remainder
+        cell ``1 - sum`` is appended (its count is the free "anything else" bucket); when they sum to
+        1 the cells alone cover the batch. Flooring each ``p*n`` and handing the leftover slots to the
+        largest fractional parts makes the counts land on ``n`` exactly while keeping each cell within
+        one of its ideal share."""
+        for p in fractions:
+            if not (0.0 <= p <= 1.0):
+                raise FandangoValueError(
+                    f"A `fraction` target must be in [0, 1]; got {p}."
+                )
+        total = math.fsum(fractions)
+        if total > 1.0 + _FRACTION_SUM_EPS:
+            raise FandangoValueError(
+                f"The same-field `fraction` cells sum to {total:.6g} > 1, so they cannot all hold at "
+                f"once. Lower a share, or drop a cell. (Cells summing to < 1 leave a free remainder.)"
+            )
+        remainder = 1.0 - total
+        has_remainder = remainder > _FRACTION_SUM_EPS
+        shares = fractions + ([remainder] if has_remainder else [])
+        raw = [p * n for p in shares]
+        counts = [math.floor(x) for x in raw]
+        leftover = n - sum(counts)
+        # Hand the leftover slots to the largest fractional remainders (ties broken by index, so the
+        # result is deterministic -- verification re-derives the same vector).
+        order = sorted(range(len(shares)), key=lambda i: (raw[i] - counts[i], -i), reverse=True)
+        for i in range(leftover):
+            counts[order[i]] += 1
+        return counts, has_remainder
+
+    def _multinomial_plan(self, job: _MultinomialJob, n: int) -> list[DerivationTree]:
+        """Construct a column whose field values realize the cells' exact fractions: apportion an
+        integer count per cell (plus a free remainder), then bucket fuzzed individuals by which
+        single cell predicate they satisfy until every count is met.
+
+        The cells must be mutually exclusive (a categorical value belongs to one cell); a candidate
+        matching two cells reveals overlapping predicates and is a spec error, raised loudly rather
+        than silently mis-attributed."""
+        cells = job.cells
+        fractions = [c.bound for c in cells]
+        counts, has_remainder = self._apportion_counts(fractions, n)
+        cell_targets = counts[: len(cells)]
+        remainder_target = counts[len(cells)] if has_remainder else 0
+
+        for cell, p, target in zip(cells, fractions, cell_targets):
+            if abs(target - p * n) > 1e-9:
+                LOGGER.warning(
+                    f"Exact fraction {p} for a cell of {job.symbol} is not achievable at N={n}; "
+                    f"using {target}/{n} = {target / n:.4f}."
+                )
+
+        inners = [self._inner(cell) for cell in cells]
+        buckets: list[list[DerivationTree]] = [[] for _ in cells]
+        remainder_bucket: list[DerivationTree] = []
+
+        def _filled() -> bool:
+            return all(
+                len(b) >= t for b, t in zip(buckets, cell_targets)
+            ) and len(remainder_bucket) >= remainder_target
+
+        cap = self._max_attempts_per_slot * n
+        attempts = 0
+        while not _filled():
+            if attempts >= cap:
+                got = ", ".join(
+                    f"{self._readable_predicate(c)}: {len(b)}/{t}"
+                    for c, b, t in zip(cells, buckets, cell_targets)
+                )
+                raise PopulationShortfallError(
+                    f"Could not assemble the categorical distribution over {job.symbol} at N={n} "
+                    f"within {cap} fuzzing attempts (per cell -- {got}; remainder: "
+                    f"{len(remainder_bucket)}/{remainder_target}). A cell value may be too rare "
+                    f"under plain fuzzing."
+                )
+            attempts += 1
+            tree = self._candidate()
+            matches = [
+                i for i, inner in enumerate(inners) if self._predicate_value(inner, tree)
+            ]
+            if len(matches) > 1:
+                overlapping = " and ".join(
+                    f"`{self._readable_predicate(cells[i])}`" for i in matches
+                )
+                raise FandangoValueError(
+                    f"Overlapping `fraction` cells on {job.symbol}: one record satisfies "
+                    f"{overlapping} at once. A categorical distribution needs mutually exclusive "
+                    f"cells (each value in exactly one), so independent shares are well defined."
+                )
+            if matches:
+                i = matches[0]
+                if len(buckets[i]) < cell_targets[i]:
+                    buckets[i].append(tree)  # else this cell is full; keep fuzzing for the rest
+            elif len(remainder_bucket) < remainder_target:
+                remainder_bucket.append(tree)
+
+        column = [tree for bucket in buckets for tree in bucket] + remainder_bucket
+        random.shuffle(column)
+        return column
+
+    def _verify_multinomial(
+        self, job: _MultinomialJob, batch: list[DerivationTree]
+    ) -> None:
+        """Independent gate: each cell's constructed count must appear in the assembled batch. Reuses
+        the single-fraction gate per cell against the apportioned target (re-derived deterministically
+        from the same fractions and N), so any bucketing bug is caught."""
+        counts, _ = self._apportion_counts([c.bound for c in job.cells], len(batch))
+        for cell, target in zip(job.cells, counts):
+            self._verify(cell, self._inner(cell), batch, target)
 
     # -- distinct-value diversity: gather representatives, fill by reuse ----- #
     def _distinct_plan(self, req: PopulationRequirement, n: int) -> list[DerivationTree]:

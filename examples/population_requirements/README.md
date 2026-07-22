@@ -42,6 +42,7 @@ Pin `PYTHONHASHSEED=0` for byte-reproducible runs.
 | `03_distribution_fit.fan` | `normal_fit(...) <= δ` | column shape within a Wasserstein tolerance; **discretization floor** |
 | `04_correlation.fan` | `correlation((<x>,<y>)) == r` | two columns coupled at a target correlation (copula search) |
 | `05_combined.fan` | several requirements + per-record `where` | disjoint-field requirements co-enforced together |
+| `10_categorical_distribution.fan` | several `fraction(...) == p` on one field | exact categorical split over that field (partial → free remainder) |
 
 ### Programmatic — the Python API
 
@@ -61,8 +62,12 @@ Pin `PYTHONHASHSEED=0` for byte-reproducible runs.
 | `*_fit(...) <= δ` | within δ by construction | δ is a 1-Wasserstein distance; `<=`/`<` only; δ must stay above the discretization floor |
 | `correlation((<x>,<y>)) OP r` | toward r | inequalities drive to ±1; `== r` targets r within `correlation_tolerance` (default 0.15) |
 
-Requirements combine when their fields are **disjoint**; same-field / nested-field sets are
-rejected with a clear error.
+Requirements combine when their fields are **disjoint**; nested-field sets are rejected with a
+clear error. The one supported *same*-field case is several `fraction(...) == p` cells on one
+field — they form a **categorical distribution** (see `10_categorical_distribution.fan`): exact
+per-value counts, mutually-exclusive cells, a free remainder when the shares sum to < 1. Mixing
+operators (`>=` with `==`) or reducers (`fraction` with `distinct_count`) on one field is still
+rejected.
 
 ## Honest limits (v1)
 

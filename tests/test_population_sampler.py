@@ -447,6 +447,145 @@ class TestPopulationSamplerJoint(unittest.TestCase):
             PopulationSampler(grammar, constraints=constraints).sample(20)
 
 
+CAT_GRAMMAR = '<start> ::= <cat> "\\n"\n<cat> ::= "1" | "2" | "3" | "4"\n'
+CAT_REGION_GRAMMAR = (
+    '<start> ::= <cat> "," <region> "\\n"\n'
+    '<cat> ::= "1" | "2" | "3" | "4"\n'
+    '<region> ::= "N" | "S" | "E" | "W"\n'
+)
+
+
+def _cat_counts(batch):
+    """{value: count} over a batch of one-column `<cat>` records."""
+    counts: dict[str, int] = {}
+    for tree in batch:
+        counts[str(tree).strip()] = counts.get(str(tree).strip(), 0) + 1
+    return counts
+
+
+class TestPopulationSamplerCategorical(unittest.TestCase):
+    """Several same-field `fraction == p` requirements form one categorical distribution over that
+    field, constructed to exact per-value counts (with a free remainder when they sum to < 1)."""
+
+    def setUp(self):
+        random.seed(0)
+
+    def _cat(self, *where_lines, grammar_src=CAT_GRAMMAR):
+        spec = grammar_src + "\n" + "\n".join(where_lines) + "\n"
+        with tempfile.NamedTemporaryFile("w", suffix=".fan", delete=False) as f:
+            f.write(spec)
+            path = f.name
+        try:
+            with open(path) as f:
+                return parse(f, use_stdlib=False, use_cache=False)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_full_partition_is_exact(self):
+        grammar, _ = self._cat(
+            "where fraction(int(<cat>) == 1 for x in population) == 0.2",
+            "where fraction(int(<cat>) == 2 for x in population) == 0.4",
+            "where fraction(int(<cat>) == 3 for x in population) == 0.1",
+            "where fraction(int(<cat>) == 4 for x in population) == 0.3",
+        )
+        batch = PopulationSampler(grammar).sample(20)
+        self.assertEqual(len(batch), 20)
+        # 0.2/0.4/0.1/0.3 of 20 = exactly 4/8/2/6 by construction.
+        self.assertEqual(_cat_counts(batch), {"1": 4, "2": 8, "3": 2, "4": 6})
+
+    def test_partial_partition_pins_cells_and_frees_remainder(self):
+        grammar, _ = self._cat(
+            "where fraction(int(<cat>) == 1 for x in population) == 0.5",
+            "where fraction(int(<cat>) == 2 for x in population) == 0.2",
+        )
+        batch = PopulationSampler(grammar).sample(20)
+        counts = _cat_counts(batch)
+        # The two declared cells are exact; the remaining 0.3 (6 records) is any other value.
+        self.assertEqual(counts.get("1"), 10)
+        self.assertEqual(counts.get("2"), 4)
+        self.assertEqual(sum(counts.values()), 20)
+        self.assertEqual(counts.get("3", 0) + counts.get("4", 0), 6)
+
+    def test_snaps_and_warns_at_awkward_n(self):
+        grammar, _ = self._cat(
+            "where fraction(int(<cat>) == 1 for x in population) == 0.2",
+            "where fraction(int(<cat>) == 2 for x in population) == 0.4",
+            "where fraction(int(<cat>) == 3 for x in population) == 0.1",
+            "where fraction(int(<cat>) == 4 for x in population) == 0.3",
+        )
+        with self.assertLogs("fandango", level="WARNING") as cm:
+            batch = PopulationSampler(grammar).sample(7)  # 0.2*7 = 1.4, not integral
+        self.assertEqual(sum(_cat_counts(batch).values()), 7)  # still exactly N
+        self.assertTrue(any("not achievable at N=7" in m for m in cm.output))
+
+    def test_sum_over_one_is_rejected(self):
+        grammar, _ = self._cat(
+            "where fraction(int(<cat>) == 1 for x in population) == 0.6",
+            "where fraction(int(<cat>) == 2 for x in population) == 0.6",
+        )
+        with self.assertRaises(FandangoValueError) as ctx:
+            PopulationSampler(grammar).sample(10)
+        self.assertIn("sum", str(ctx.exception).lower())
+
+    def test_overlapping_predicates_are_rejected(self):
+        # `== 1` and `< 3` both match cat==1: not mutually exclusive, so shares are ill-defined.
+        grammar, _ = self._cat(
+            "where fraction(int(<cat>) == 1 for x in population) == 0.3",
+            "where fraction(int(<cat>) < 3 for x in population) == 0.3",
+        )
+        with self.assertRaises(FandangoValueError) as ctx:
+            PopulationSampler(grammar).sample(10)
+        self.assertIn("overlap", str(ctx.exception).lower())
+
+    def test_mixed_operators_on_one_field_rejected(self):
+        grammar, _ = self._cat(
+            "where fraction(int(<cat>) == 1 for x in population) == 0.3",
+            "where fraction(int(<cat>) == 2 for x in population) >= 0.3",
+        )
+        with self.assertRaises(FandangoValueError) as ctx:
+            PopulationSampler(grammar).sample(10)
+        self.assertIn("==", str(ctx.exception))
+
+    def test_multinomial_composes_with_a_disjoint_requirement(self):
+        grammar, constraints = self._cat(
+            "where fraction(int(<cat>) == 1 for x in population) == 0.25",
+            "where fraction(int(<cat>) == 2 for x in population) == 0.25",
+            "where distinct_count(<region> for x in population) >= 3",
+            grammar_src=CAT_REGION_GRAMMAR,
+        )
+        batch = PopulationSampler(grammar, constraints=constraints).sample(20)
+        rows = [str(t).strip().split(",") for t in batch]
+        cats = [r[0] for r in rows]
+        regions = [r[1] for r in rows]
+        self.assertEqual(sum(c == "1" for c in cats), 5)
+        self.assertEqual(sum(c == "2" for c in cats), 5)
+        self.assertGreaterEqual(REDUCERS["distinct_count"](regions), 3)
+
+    def test_lone_fraction_is_unchanged(self):
+        # A single same-field fraction is still a plain requirement (regression, not a multinomial).
+        grammar, _ = self._cat(
+            "where fraction(int(<cat>) == 1 for x in population) == 0.5",
+        )
+        batch = PopulationSampler(grammar).sample(10)
+        self.assertEqual(_cat_counts(batch).get("1"), 5)
+
+    def test_apportionment_sums_to_n_and_floors_partial(self):
+        sampler = PopulationSampler(self._cat()[0])
+        # Full partition: largest-remainder lands each cell on its ideal share.
+        counts, has_rem = sampler._apportion_counts([0.2, 0.4, 0.1, 0.3], 20)
+        self.assertEqual(counts, [4, 8, 2, 6])
+        self.assertFalse(has_rem)
+        # Awkward N still sums to N with a snap.
+        counts, _ = sampler._apportion_counts([0.2, 0.4, 0.1, 0.3], 7)
+        self.assertEqual(sum(counts), 7)
+        # Partial partition appends a free remainder cell.
+        counts, has_rem = sampler._apportion_counts([0.5, 0.2], 20)
+        self.assertTrue(has_rem)
+        self.assertEqual(sum(counts), 20)
+        self.assertEqual(counts[:2], [10, 4])
+        self.assertEqual(counts[2], 6)  # the remainder
+
+
 CORR_GRAMMAR = (
     '<start> ::= <age> "," <income> "\\n"\n'
     "<age> ::= r'[0-9][0-9]'\n"

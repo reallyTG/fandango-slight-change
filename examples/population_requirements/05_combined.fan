@@ -3,8 +3,9 @@
 # Multiple population requirements are enforced together when they target DISJOINT fields
 # (each field constrained by at most one requirement). The sampler plans a column per
 # requirement and grafts each field into shared skeleton records, so the requirements don't
-# interfere and every requirement's gate holds independently. Same-field / nested-field sets
-# are rejected with a clear error.
+# interfere and every requirement's gate holds independently. Nested-field sets are rejected
+# with a clear error; several `fraction(...) == p` cells on ONE field are the exception — they
+# form a categorical distribution over that field (see 10_categorical_distribution.fan).
 #
 # Per-record `where` constraints (no `population` binder) are HARD validity rules, co-enforced
 # alongside the population requirements: every constructed record satisfies them (the sampler

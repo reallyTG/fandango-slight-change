@@ -295,7 +295,32 @@ where correlation((int(<education_num>), int(<hours>)) for x in population) >= 0
 | `correlation((<x>,<y>)) OP r` | toward r | `>=`/etc. drive to the ±1 extreme; `== r` targets r via a copula search within `correlation_tolerance` |
 
 Requirements are combined when they target **disjoint fields** (each field is constrained by
-at most one requirement); same-field and nested-field sets are rejected with a clear error.
+at most one requirement); nested-field sets are rejected with a clear error.
+
+#### Categorical distribution over one field
+
+The one *same*-field case that **is** combined: several `fraction(<pred>) == p` requirements on
+one field form a **categorical distribution** over that field. The sampler buckets records by
+which single cell each satisfies and assembles the exact per-value counts.
+
+```
+where fraction(int(<cat>) == 1 for x in population) == 0.2
+where fraction(int(<cat>) == 2 for x in population) == 0.4
+where fraction(int(<cat>) == 3 for x in population) == 0.1
+where fraction(int(<cat>) == 4 for x in population) == 0.3
+```
+
+- **Mutually exclusive cells.** Each record's value must belong to exactly one cell; a record
+  satisfying two cells (e.g. `== 1` and `< 3`) is a spec error, raised loudly.
+- **Partial partitions.** The shares may sum to `< 1` — the leftover is a free "anything else"
+  remainder bucket. Summing to `> 1` is rejected.
+- **Snap-and-warn.** Counts use largest-remainder apportionment so they sum to `N` exactly; when
+  a `p·N` is non-integral the cell snaps and a warning names the effective share (as for a single
+  quota).
+- All cells must use `==`. Mixing operators (a `>=` alongside `==`) or reducers (`fraction` with
+  `distinct_count`) on one field is rejected. Inequality-cell distributions are future work.
+
+See [`examples/population_requirements/10_categorical_distribution.fan`](../examples/population_requirements/10_categorical_distribution.fan).
 
 ```{admonition} The discretization floor (why δ can't be arbitrarily small)
 :class: note
