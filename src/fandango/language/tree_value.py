@@ -286,7 +286,6 @@ DIRECT_ACCESS_METHODS_BASE_TO_UNDERLYING_TYPE = [
     "__and__",
     "__abs__",
     "__ceil__",
-    "__float__",
     "__floor__",
     "__index__",
     "__invert__",
@@ -630,6 +629,15 @@ class TreeValue:
 
     def __int__(self) -> int:
         return self.to_int()
+
+    def __float__(self) -> float:
+        """
+        Strings and bytes are parsed as a float literal, so `"1.5"` and `"2e0"`
+        convert; a value of trailing bits only converts its integer.
+        """
+        if self._value is None:  # only trailing bits
+            return float(trailing_bits_to_int(self._trailing_bits))
+        return float(self.to_string())
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, TreeValue):

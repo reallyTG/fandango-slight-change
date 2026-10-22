@@ -268,7 +268,6 @@ def test_direct_access_simple():
 UNDERLYING_TYPE_NO_ARGS = [
     "__abs__",
     "__ceil__",
-    "__float__",
     "__floor__",
     "__index__",
     "__invert__",
@@ -554,6 +553,17 @@ def test_to_first_arg(method):
     assert run > 0, (
         f"{method} not found in dirs of 1, {set(dir(1) + dir('1') + dir(b'1'))}"
     )
+
+
+@pytest.mark.parametrize("text", ["2", "-0.5", "1.5", "2e0", "5E-1"])
+def test_float_parses_the_text(text):
+    assert float(TreeValue(text)) == float(text)
+    assert float(DerivationTree(Terminal(text))) == float(text)
+    assert float(TreeValue(text.encode())) == float(text)
+
+
+def test_float_of_trailing_bits():
+    assert float(TreeValue(1)) == 1.0
 
 
 def test_check_all_direct_methods_tested():
