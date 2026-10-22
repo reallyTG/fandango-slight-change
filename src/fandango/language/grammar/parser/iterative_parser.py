@@ -441,6 +441,11 @@ class IterativeParser:
         if state.position < column_index:
             entry = self._leo_entry(table, state.position, state.nonterminal)
             if entry is not None:
+                # The shortcut completes every item on the chain without
+                # visiting it; record their symbols as finished too.
+                if entry.chain is not None:
+                    for skipped in entry.chain:
+                        self.spectra["finished"].add(skipped.nonterminal)
                 top = entry.top
                 next_state = top.next(force_completed)
                 if force_completed and self._closes_cycle(
