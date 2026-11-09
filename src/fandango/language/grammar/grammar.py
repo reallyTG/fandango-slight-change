@@ -252,11 +252,26 @@ class Grammar(NodeVisitor[list[Node], list[Node]]):
         start: str | NonTerminal = "<start>",
         max_nodes: int = 50,
         prefix_node: Optional[DerivationTree] = None,
+        require: Optional[Any] = None,
+        shortest: bool = True,
     ) -> DerivationTree:
         """
         Generate a random derivation tree from the grammar.
+
+        With `require`, the tree's derivation is guaranteed to use that grammar
+        node: `(rule, alt_index)` for a top-level alternative of `rule`, or any
+        node of the grammar. See `fandango.language.grammar.directed`;
+        `shortest` picks a shortest path to it (True) or a random one that fits
+        `max_nodes` (False). `require` cannot be combined with `prefix_node`.
         :raise FandangoGeneratorError: If a called generator could not be parsed into the symbol, it applies to.
+        :raise FandangoValueError: If `require` cannot be reached from `start`.
         """
+        if require is not None:
+            if prefix_node is not None:
+                raise FandangoValueError("require cannot be combined with prefix_node")
+            from fandango.language.grammar import directed
+
+            return directed.fuzz_through(self, require, start, max_nodes, shortest)
         if isinstance(start, str):
             start = NonTerminal(start)
         if prefix_node is None:
